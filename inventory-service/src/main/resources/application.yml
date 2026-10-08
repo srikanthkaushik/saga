@@ -1,0 +1,47 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: inventory-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/inventory_db
+    username: saga
+    password: saga
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+    consumer:
+      group-id: ${spring.application.name}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      # one consumer thread per partition: a record in blocking retry stalls only its own partition
+      concurrency: 3
+
+saga:
+  outbox:
+    poll-interval: 500ms
+    batch-size: 100
+  kafka:
+    retry:
+      max-retries: 4
+      initial-interval: 500ms
+      multiplier: 2.0
+      max-interval: 10s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,dlt

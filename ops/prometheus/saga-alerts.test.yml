@@ -1,0 +1,76 @@
+# promtool unit tests for saga-alerts.yml. Run from the repo root (CMD):
+#   docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prometheus test rules /rules/saga-alerts.test.yml
+rule_files:
+  - saga-alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # Two order-service instances report the same DB-wide value: must alert with 1, not 2.
+  - interval: 15s
+    input_series:
+      - series: 'saga_compensation_stuck{instance="order-1"}'
+        values: '0 0 1x10'
+      - series: 'saga_compensation_stuck{instance="order-2"}'
+        values: '0 0 1x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SagaCompensationStuck
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: SagaCompensationStuck
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "1 saga compensation(s) stuck"
+              description: >-
+                1 saga(s) have re-sent their refund/release command at least
+                saga.alert.stuck-after-resends times without a reply. Customers may be charged or stock held
+                for rejected orders. List them with GET /actuator/stucksagas on order-service, then check
+                GET /actuator/dlt on payment-service / inventory-service for the failing compensation.
+                Runbook: ops/RUNBOOK.md
+
+  # A blip shorter than the 1m "for" never fires.
+  - interval: 15s
+    input_series:
+      - series: 'saga_compensation_stuck{instance="order-1"}'
+        values: '0 1 1 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SagaCompensationStuck
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'saga_compensation_oldest_age_seconds{instance="order-1"}'
+        values: '0+60x20'
+      - series: 'saga_compensation_stuck{instance="order-1"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SagaCompensationSlow
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: SagaCompensationSlow
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: "A saga has been compensating for 16m 0s"
+              description: >-
+                The oldest in-progress compensation is older than 10 minutes but not yet past the stuck
+                threshold. Usually a participant is slow or retrying; investigate before it becomes stuck.
+
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: SagaCompensationMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: "No saga compensation metrics are being scraped"
+              description: >-
+                order-service is down or no longer scraped, so stuck compensations would go unnoticed.

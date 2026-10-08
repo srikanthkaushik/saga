@@ -1,0 +1,40 @@
+# Prometheus alerting rules for the order saga.
+# Metrics come from order-service /actuator/prometheus. The gauges are database-wide, so every
+# order-service instance reports the same value: aggregate with max(), never sum().
+groups:
+  - name: saga-compensation
+    rules:
+      - alert: SagaCompensationStuck
+        expr: max(saga_compensation_stuck) > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} saga compensation(s) stuck"
+          description: >-
+            {{ $value }} saga(s) have re-sent their refund/release command at least
+            saga.alert.stuck-after-resends times without a reply. Customers may be charged or stock held
+            for rejected orders. List them with GET /actuator/stucksagas on order-service, then check
+            GET /actuator/dlt on payment-service / inventory-service for the failing compensation.
+            Runbook: ops/RUNBOOK.md
+
+      - alert: SagaCompensationSlow
+        expr: max(saga_compensation_oldest_age_seconds) > 600
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A saga has been compensating for {{ $value | humanizeDuration }}"
+          description: >-
+            The oldest in-progress compensation is older than 10 minutes but not yet past the stuck
+            threshold. Usually a participant is slow or retrying; investigate before it becomes stuck.
+
+      - alert: SagaCompensationMetricsMissing
+        expr: absent(saga_compensation_stuck)
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "No saga compensation metrics are being scraped"
+          description: >-
+            order-service is down or no longer scraped, so stuck compensations would go unnoticed.
