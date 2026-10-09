@@ -19,3 +19,6 @@ Thumbs.db
 
 # Deployment settings with secrets
 .env
+
+# Personal deployments (kept locally, never published)
+deploy-local/
