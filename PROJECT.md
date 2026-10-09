@@ -1,5 +1,7 @@
 # SAGA — Project status
 
+> New here? Start with the [README](README.md) and the guides in [`docs/`](docs/): [Getting started](docs/GETTING-STARTED.md), [Architecture](docs/ARCHITECTURE.md), [Scenarios](docs/SCENARIOS.md), [Codebase tour](docs/CODEBASE.md). This file is the status and decision log.
+
 Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQL 17, Kafka 4.0 (KRaft), multi-module Maven.
 
 **Checkpoint 2026-10-09:** feature-complete for the core saga plus its failure handling: outbox, idempotency, DLT with backoff and replay, timeouts with fencing, stuck-compensation alerting, and manual resolution. A local **saga console** (`saga-ui`, http://localhost:8080) demos and exercises all of it. 23 e2e tests green, promtool rule tests green. Not yet production-hardened; see [Next / open](#next--open), and above all the unauthenticated actuator and seed endpoints.
