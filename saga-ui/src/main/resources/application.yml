@@ -1,0 +1,32 @@
+server:
+  port: 8080
+  # Unauthenticated test tooling: local machine only
+  address: 127.0.0.1
+
+spring:
+  application:
+    name: saga-ui
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        # fail fast in the UI when Kafka is down instead of blocking for the 60s default
+        max.block.ms: 5000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
+
+saga:
+  ui:
+    services:
+      order: http://localhost:8081
+      payment: http://localhost:8082
+      inventory: http://localhost:8083
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

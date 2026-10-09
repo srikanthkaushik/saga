@@ -85,15 +85,23 @@ class SagaEndToEndIT {
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final List<ServiceProcess> SERVICES = new ArrayList<>();
     private static ServiceProcess orderService;
+    private static ServiceProcess paymentService;
     private static ServiceProcess inventoryService;
+    private static ServiceProcess uiService;
     private static KafkaProbe kafka;
 
     @BeforeAll
     static void startServices() throws Exception {
         Path logDir = Path.of(System.getProperty("saga.e2e.log-dir"));
         orderService = launch("order-service", "saga.e2e.order-jar", "order_db", logDir);
-        launch("payment-service", "saga.e2e.payment-jar", "payment_db", logDir);
+        paymentService = launch("payment-service", "saga.e2e.payment-jar", "payment_db", logDir);
         inventoryService = launch("inventory-service", "saga.e2e.inventory-jar", "inventory_db", logDir);
+        uiService = ServiceProcess.start("saga-ui", Path.of(System.getProperty("saga.e2e.ui-jar")), logDir, Map.of(
+                "spring.kafka.bootstrap-servers", KAFKA.getBootstrapServers(),
+                "saga.ui.services.order", orderService.baseUrl(),
+                "saga.ui.services.payment", paymentService.baseUrl(),
+                "saga.ui.services.inventory", inventoryService.baseUrl()));
+        SERVICES.add(uiService);
         for (ServiceProcess service : SERVICES) {
             service.awaitHealthy(HTTP);
         }
@@ -477,6 +485,115 @@ class SagaEndToEndIT {
         assertThat(paymentStatus(orderId)).isEqualTo("REFUNDED");
         assertThat(credit(customer)).isEqualByComparingTo("100.00");
         assertThat(stuckSagaFor(orderId)).isNull();
+    }
+
+    // ---- read / seed APIs and the saga console --------------------------------------------------
+
+    @Test
+    void readApis_exposeParticipantState_andOutboxesFormTheTimeline() throws Exception {
+        String customer = seedCustomer("100.00");
+        String product = seedProduct(0);
+        UUID orderId = placeOrder(customer, product, 1, "30.00");
+        awaitTerminal(orderId);
+
+        JsonNode payment = JSON.readTree(get(paymentService, "/payments/" + orderId));
+        assertThat(payment.get("status").asString()).isEqualTo("REFUNDED");
+        assertThat(payment.get("amount").decimalValue()).isEqualByComparingTo("30.00");
+        assertThat(status(inventoryService, "/reservations/" + orderId)).isEqualTo(404);
+        assertThat(JSON.readTree(get(paymentService, "/customers/" + customer)).get("availableCredit").decimalValue())
+                .isEqualByComparingTo("100.00");
+        assertThat(JSON.readTree(get(inventoryService, "/products/" + product)).get("availableQuantity").asInt()).isZero();
+
+        // Commands live in order-service's outbox, replies in the participants': together the saga's timeline
+        assertThat(outboxTypes(orderService, orderId)).containsExactly("ProcessPayment", "ReserveInventory", "RefundPayment");
+        assertThat(outboxTypes(paymentService, orderId)).containsExactly("PaymentProcessed", "PaymentRefunded");
+        assertThat(outboxTypes(inventoryService, orderId)).containsExactly("InventoryFailed");
+        JsonNode first = JSON.readTree(get(orderService, "/actuator/outbox/" + orderId)).get(0);
+        assertThat(first.get("topic").asString()).isEqualTo("payment.commands");
+        assertThat(first.get("payload").get("customerId").asString()).isEqualTo(customer);
+        assertThat(first.get("publishedAt").isNull()).isFalse();
+
+        JsonNode recent = JSON.readTree(get(orderService, "/orders?limit=200"));
+        assertThat(recent.valueStream().map(o -> o.get("id").asString())).contains(orderId.toString());
+        assertThat(recent.get(0).get("createdAt").asString()).isGreaterThanOrEqualTo(recent.get(recent.size() - 1).get("createdAt").asString());
+    }
+
+    @Test
+    void seedApis_upsertAndValidate() throws Exception {
+        String id = "seed-" + UUID.randomUUID();
+        assertThat(put(paymentService, "/customers/" + id, "{\"availableCredit\":12.50}").statusCode()).isEqualTo(200);
+        assertThat(put(paymentService, "/customers/" + id, "{\"availableCredit\":99.00}").statusCode()).isEqualTo(200);
+        assertThat(credit(id)).isEqualByComparingTo("99.00");
+        assertThat(put(paymentService, "/customers/" + id, "{\"availableCredit\":-1}").statusCode()).isEqualTo(400);
+        assertThat(put(paymentService, "/customers/bad%20id", "{\"availableCredit\":1}").statusCode()).isEqualTo(400);
+
+        assertThat(put(inventoryService, "/products/" + id, "{\"availableQuantity\":7}").statusCode()).isEqualTo(200);
+        assertThat(stock(id)).isEqualTo(7);
+        assertThat(put(inventoryService, "/products/" + id, "{\"availableQuantity\":-1}").statusCode()).isEqualTo(400);
+        assertThat(status(paymentService, "/customers/does-not-exist")).isEqualTo(404);
+    }
+
+    @Test
+    void sagaConsole_servesPage_proxiesServices_andInjectsMessages() throws Exception {
+        assertThat(get(uiService, "/")).contains("<title>Saga console</title>");
+        assertThat(get(uiService, "/app.js")).contains("derivePath");
+
+        // Seed and order entirely through the console's proxy
+        String id = "ui-" + UUID.randomUUID();
+        assertThat(put(uiService, "/api/payment/customers/" + id, "{\"availableCredit\":100}").statusCode()).isEqualTo(200);
+        assertThat(put(uiService, "/api/inventory/products/" + id, "{\"availableQuantity\":3}").statusCode()).isEqualTo(200);
+        HttpResponse<String> created = HTTP.send(HttpRequest.newBuilder(URI.create(uiService.baseUrl() + "/api/order/orders"))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(
+                                "{\"customerId\":\"" + id + "\",\"productId\":\"" + id + "\",\"quantity\":1,\"amount\":10.00}"))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        UUID orderId = UUID.fromString(JSON.readTree(created.body()).get("id").asString());
+        assertThat(awaitTerminal(orderId).get("status").asString()).isEqualTo("APPROVED");
+        assertThat(JSON.readTree(get(uiService, "/api/order/orders/" + orderId + "?ignored=1")).get("status").asString())
+                .isEqualTo("APPROVED");
+
+        // Errors pass through untouched; unknown services are not proxied
+        assertThat(status(uiService, "/api/order/orders/" + UUID.randomUUID())).isEqualTo(404);
+        assertThat(status(uiService, "/api/somewhere/else")).isEqualTo(404);
+        assertThat(get(uiService, "/api/order/actuator/prometheus")).contains("saga_compensation_stuck");
+
+        // Injection publishes in the services' wire format
+        HttpResponse<String> injected = post(uiService, "/api/inject",
+                "{\"topic\":\"payment.commands\",\"messageType\":\"NoSuchCommand\",\"payload\":\"{}\"}");
+        assertThat(injected.statusCode()).as(injected.body()).isEqualTo(200);
+        UUID messageId = UUID.fromString(JSON.readTree(injected.body()).get("messageIds").get(0).asString());
+        kafka.awaitDeadLetter("payment.commands-dlt", messageId, DLT_TIMEOUT)
+                .orElseThrow(() -> new AssertionError("injected message " + messageId + " never dead-lettered"));
+        assertThat(post(uiService, "/api/inject", "{\"topic\":\"__consumer_offsets\",\"messageType\":\"X\",\"payload\":\"{}\"}")
+                .statusCode()).isEqualTo(400);
+    }
+
+    private static List<String> outboxTypes(ServiceProcess service, UUID orderId) throws Exception {
+        return JSON.readTree(get(service, "/actuator/outbox/" + orderId)).valueStream()
+                .map(m -> m.get("messageType").asString()).toList();
+    }
+
+    private static int status(ServiceProcess service, String path) throws Exception {
+        return HTTP.send(HttpRequest.newBuilder(URI.create(service.baseUrl() + path)).build(),
+                HttpResponse.BodyHandlers.discarding()).statusCode();
+    }
+
+    private static HttpResponse<String> put(ServiceProcess service, String path, String body) throws Exception {
+        return HTTP.send(HttpRequest.newBuilder(URI.create(service.baseUrl() + path))
+                        .header("Content-Type", "application/json")
+                        .PUT(HttpRequest.BodyPublishers.ofString(body))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static HttpResponse<String> post(ServiceProcess service, String path, String body) throws Exception {
+        return HTTP.send(HttpRequest.newBuilder(URI.create(service.baseUrl() + path))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
     }
 
     // ---- manual resolution ----------------------------------------------------------------------

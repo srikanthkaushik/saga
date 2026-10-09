@@ -2,16 +2,17 @@
 
 Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQL 17, Kafka 4.0 (KRaft), multi-module Maven.
 
-**Checkpoint 2026-10-08:** feature-complete for the core saga plus its failure handling: outbox, idempotency, DLT with backoff and replay, timeouts with fencing, stuck-compensation alerting, and manual resolution. 20 e2e tests green, promtool rule tests green. Not yet production-hardened; see [Next / open](#next--open), and above all the unauthenticated actuator.
+**Checkpoint 2026-10-09:** feature-complete for the core saga plus its failure handling: outbox, idempotency, DLT with backoff and replay, timeouts with fencing, stuck-compensation alerting, and manual resolution. A local **saga console** (`saga-ui`, http://localhost:8080) demos and exercises all of it. 23 e2e tests green, promtool rule tests green. Not yet production-hardened; see [Next / open](#next--open), and above all the unauthenticated actuator and seed endpoints.
 
 ## Modules
 | Module | Port | Role |
 |---|---|---|
-| `saga-common` | – | Message contracts, JSON codec, transactional outbox + relay, idempotent-consumer guard, Kafka error handling (retry/DLT), DLT replay endpoint, topic beans |
+| `saga-common` | – | Message contracts, JSON codec, transactional outbox + relay, idempotent-consumer guard, Kafka error handling (retry/DLT), DLT replay and outbox actuator endpoints, topic beans |
 | `order-service` | 8081 | REST API, saga orchestrator, timeout scanner, stuck-compensation metrics, `stucksagas` endpoint (list / detail / retry / resolve) |
-| `payment-service` | 8082 | Debits and refunds customer credit |
-| `inventory-service` | 8083 | Reserves and releases stock |
-| `saga-e2e` | random | Testcontainers end-to-end tests that run the real service jars as child processes |
+| `payment-service` | 8082 | Debits and refunds customer credit; read/seed APIs for customers and payments |
+| `inventory-service` | 8083 | Reserves and releases stock; read/seed APIs for products and reservations |
+| `saga-ui` | 8080 (127.0.0.1) | Saga console: static single-page UI, same-origin proxy to the three services, Kafka message injector. No DB, no saga-common dependency |
+| `saga-e2e` | random | Testcontainers end-to-end tests that run the real service and console jars as child processes |
 
 Each service owns its database (`order_db`, `payment_db`, `inventory_db`) on one Postgres instance. Other files:
 - `docker-compose.yml` (Postgres + Kafka for local runs)
@@ -109,10 +110,35 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 | `saga.alert.stuck-after-resends` | 3 | order | about 2 minutes with 30s compensation timeouts |
 | `saga.alert.refresh-interval` | 15s | order | gauge refresh |
 
+## Saga console (`saga-ui`)
+- **Saga tab:**
+  - Scenario buttons seed a fresh customer and product, then place orders: happy path, insufficient credit, out of stock (refund), and a burst of ten.
+  - Order detail has a **transit-map state machine** lighting the route taken (cobalt = forward, amber = compensation), plus a **message timeline**: the order, payment and inventory outboxes merged into swimlanes, with operator interventions included.
+  - Payment and inventory state cards.
+  - The saga card shows the deadline countdown and re-sends, plus Retry/Resolve forms while compensating.
+- **Operations tab:** compensation metric tiles, the stuck-saga list, DLT pending counts with replay, the message injector (presets for non-retryable, retryable-crash, unknown-saga and malformed messages), and a timeout/stuck demo guide.
+- **Customers & products tab:** view and set credit and stock.
+- **API console tab:** a clickable catalogue of **every endpoint** across the three services and the console, with method, path, body and pretty-printed response.
+- **Plumbing:**
+  - `/api/{order|payment|inventory}/**` is a pass-through proxy (status and body untouched; 502 JSON when a service is down; targets in `saga.ui.services.*`). `/api/inject` publishes raw records to the three saga topics only.
+  - Links are shareable: `#tab=ops`, `#order=<id>`.
+  - Vanilla JS, no build step; server data is rendered with `textContent`. Light and dark themes.
+
+## REST APIs
+| Endpoint | Service | Purpose |
+|---|---|---|
+| `POST /orders`, `GET /orders/{id}` | order | place an order; order + saga state |
+| `GET /orders?limit=50` | order | recent orders, newest first (limit 1–200) |
+| `GET /customers`, `GET /customers/{id}`, `PUT /customers/{id}` `{"availableCredit"}` | payment | credit; **PUT is seed tooling** |
+| `GET /payments/{orderId}` | payment | COMPLETED / REFUNDED / CANCELLED tombstone |
+| `GET /products`, `GET /products/{id}`, `PUT /products/{id}` `{"availableQuantity"}` | inventory | stock; **PUT is seed tooling** |
+| `GET /reservations/{orderId}` | inventory | RESERVED / RELEASED |
+
 ## Actuator endpoints
 | Endpoint | Service | Purpose |
 |---|---|---|
 | `GET /actuator/health`, `/info` | all | liveness/info |
+| `GET /actuator/outbox/{orderId}` | all | messages this service emitted for an order (payload as JSON, created/published times). Merged across services = the saga timeline |
 | `GET /actuator/dlt`, `GET /actuator/dlt/{topic}` | all | owned DLTs with pending counts |
 | `POST /actuator/dlt/{topic}` body `{"limit":n}` | all | replay pending records (default 100, max 10000) |
 | `GET /actuator/stucksagas` | order | stuck sagas, oldest first |
@@ -144,6 +170,7 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 | payment | V2 | payment customer_id/amount nullable for CANCELLED tombstones (+ check constraint) |
 | inventory | V1 | product, reservation, outbox, processed_message + seed |
 | inventory | V2 | `reservation.status`, `released_at` |
+| order V5 / payment V3 / inventory V3 | – | `outbox(message_key)` index for the outbox endpoint |
 
 ## Boot 4 gotchas (verified)
 - Starters: `spring-boot-starter-webmvc` (not `-web`), `spring-boot-starter-kafka`, and `spring-boot-starter-flyway` + `flyway-database-postgresql`. Prometheus export: `io.micrometer:micrometer-registry-prometheus`.
@@ -152,6 +179,8 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 - `@EntityScan` lives in `org.springframework.boot.persistence.autoconfigure` (avoided via package layout).
 - Spring Kafka's default DLT suffix is `-dlt` (not `.DLT`). A `CommonErrorHandler` bean is auto-wired into Boot's listener factory.
 - Custom actuator endpoints: optional params use jspecify `@Nullable`; write-op params bind from the JSON body; `WebEndpointResponse` sets the status.
+- **Don't put `@Validated` on `@RestController`s.** Spring MVC (6.1+) validates constraint-annotated params itself and answers 400 (`HandlerMethodValidationException`). Class-level `@Validated` routes them through the AOP `MethodValidationInterceptor` instead, whose `ConstraintViolationException` surfaces as a 500.
+- Proxying with `RestClient`: use `exchange(...)` to pass upstream 4xx/5xx through untouched (no status handlers run), and `JdkClientHttpRequestFactory` for connect and read timeouts.
 - Testcontainers 2.x: `testcontainers-postgresql`/`-kafka`/`-junit-jupiter`. Use `org.testcontainers.postgresql.PostgreSQLContainer` (non-generic) and `org.testcontainers.kafka.KafkaContainer`.
 - A fresh broker logs `NotCoordinatorException` for a few seconds while `__consumer_offsets` is created. Harmless.
 
@@ -162,15 +191,19 @@ mvn clean install -DskipITs
 start "order"     java -jar order-service\target\order-service-0.0.1-SNAPSHOT.jar
 start "payment"   java -jar payment-service\target\payment-service-0.0.1-SNAPSHOT.jar
 start "inventory" java -jar inventory-service\target\inventory-service-0.0.1-SNAPSHOT.jar
+start "console"   java -jar saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
+start http://localhost:8080
 
 curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"customer-1\",\"productId\":\"product-1\",\"quantity\":2,\"amount\":100.00}"
 curl http://localhost:8081/orders/<id>
 ```
 - Seed data: `customer-1` has 1000.00 credit and `customer-2` 50.00. `product-1` has qty 100; `product-2` has qty 0, which forces a compensation.
-- Operator commands (DLT replay, stuck sagas, retry/resolve) are in `ops\RUNBOOK.md`.
+- Operator commands (DLT replay, stuck sagas, retry/resolve) are in `ops\RUNBOOK.md`; the console does the same from its Operations tab.
+- **Editing the console:** to work on the UI without rebuilding, start it with `--spring.web.resources.static-locations=file:saga-ui/src/main/resources/static/ --spring.web.resources.cache.period=0` and refresh the browser.
+- **Faster timeout demo:** start order-service with `--saga.timeout.payment=10s --saga.timeout.compensation=10s`.
 
 ## Tests
-- `mvn clean verify` builds everything and runs `SagaEndToEndIT`: 20 tests, about 80s. Docker is required; the suite is skipped automatically without it. Add `-DskipITs` to skip it.
+- `mvn clean verify` builds everything and runs `SagaEndToEndIT`: 23 tests, about 110s. Docker is required; the suite is skipped automatically without it. Add `-DskipITs` to skip it.
 - Alert rules are tested separately:
   ```
   docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prometheus test rules /rules/saga-alerts.test.yml
@@ -192,6 +225,8 @@ curl http://localhost:8081/orders/<id>
 | Fencing | refund-before-charge and release-before-reserve leave tombstones, and the late command is refused |
 | Alerting | a failing refund (DB trigger) → appears in `stucksagas`, gauge ≥ 1, Prometheus output present; clears after the fix |
 | Intervention | retry resets the count and is audited; resolve after a manual refund → FAILED/REJECTED and the late queued refund is a no-op (no double refund); 400/404/409 cases |
+| Read / seed APIs | payment and reservation status, credit and stock reads; outboxes give exactly `ProcessPayment, ReserveInventory, RefundPayment` / `PaymentProcessed, PaymentRefunded` / `InventoryFailed` for a compensated order; orders list newest-first; PUT upsert, and 400 for negative values or a bad id |
+| Console (`saga-ui`) | serves the page; seed and order **through the proxy** → APPROVED; upstream 404 passes through; unknown service 404; Prometheus via proxy; `/api/inject` lands on the DLT; non-saga topic → 400 |
 | Alert rules (promtool) | stuck fires once with two instances (`max`), ignores blips shorter than `for`; slow and missing alerts fire. Checked to fail if `max` is swapped for `sum` |
 
 ## Done
@@ -202,9 +237,17 @@ curl http://localhost:8081/orders/<id>
 - [x] Saga timeouts + ReleaseInventory compensation + tombstone fencing + listener concurrency 3
 - [x] Stuck-compensation alerting: metrics, Prometheus export, alert rules + promtool tests
 - [x] Manual resolution: retry/resolve with audit trail, saga detail view, operator runbook
+- [x] 2026-10-09: saga console (`saga-ui`) + read/seed APIs + outbox endpoint.
+  - Checked in headless Chrome over CDP: every scenario renders the right status, map route and message count; ops tiles, DLT replay, inject, data save, API console, deep links and intervene (resolve without a note is refused; retry completes the saga) all work, with no JS errors.
+  - That browser check is a one-off script and is **not** in the repo.
 
 ## Next / open
-- [ ] **Secure actuator** (separate `management.server.port` and/or Spring Security). `dlt` replay and `stucksagas` retry/resolve are unauthenticated today. Required before any shared environment.
+- [ ] **Secure actuator and the seed endpoints** (separate `management.server.port` and/or Spring Security). Unauthenticated today:
+  - `dlt` replay, `stucksagas` retry/resolve and `outbox`;
+  - `PUT /customers/{id}` and `PUT /products/{id}`, which can rewrite balances and stock.
+  
+  Required before any shared environment. Then also decide whether `saga-ui` should exist outside local/dev at all (it binds 127.0.0.1 by default).
+- [ ] Browser tests for the console in CI (e.g. Playwright for Java), if it becomes more than a dev tool.
 - [ ] Per-service slice tests (orchestrator transitions on illegal or out-of-order replies, duplicate-delivery idempotency). Today everything is proven through e2e only.
 - [ ] Alert on DLT pending > 0 (expose `DltReplayer.status` as a gauge, add a rule and a runbook entry).
 - [ ] Participant-side admin operations (refund or release through payment and inventory endpoints) so `resolve` never needs raw SQL.

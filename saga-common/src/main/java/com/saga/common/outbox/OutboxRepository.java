@@ -17,4 +17,6 @@ public interface OutboxRepository extends JpaRepository<OutboxMessage, UUID> {
             for update skip locked
             """, nativeQuery = true)
     List<OutboxMessage> lockUnpublishedBatch(@Param("limit") int limit);
+
+    List<OutboxMessage> findByMessageKeyOrderByCreatedAt(String messageKey);
 }

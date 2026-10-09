@@ -15,4 +15,6 @@ public interface ReservationRepository extends JpaRepository<Reservation, UUID> 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select r from Reservation r where r.orderId = :orderId")
     Optional<Reservation> findByOrderIdForUpdate(@Param("orderId") UUID orderId);
+
+    Optional<Reservation> findByOrderId(UUID orderId);
 }

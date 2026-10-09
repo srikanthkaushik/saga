@@ -19,6 +19,19 @@ public class Product {
     protected Product() {
     }
 
+    public Product(String productId, int availableQuantity) {
+        this.productId = productId;
+        setAvailableQuantity(availableQuantity);
+    }
+
+    /** Admin/test seeding only; saga processing goes through {@link #reserve} and {@link #release}. */
+    public void setAvailableQuantity(int availableQuantity) {
+        if (availableQuantity < 0) {
+            throw new IllegalArgumentException("Stock cannot be negative");
+        }
+        this.availableQuantity = availableQuantity;
+    }
+
     public boolean hasStock(int quantity) {
         return availableQuantity >= quantity;
     }

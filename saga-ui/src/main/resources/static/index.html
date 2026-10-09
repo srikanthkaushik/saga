@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Saga console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+    <h1 class="brand">Saga console</h1>
+    <ul class="health" id="health" aria-label="Service health"></ul>
+    <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="saga" aria-selected="true">Saga</button>
+        <button role="tab" data-tab="ops" aria-selected="false">Operations</button>
+        <button role="tab" data-tab="data" aria-selected="false">Customers &amp; products</button>
+        <button role="tab" data-tab="console" aria-selected="false">API console</button>
+    </nav>
+</header>
+
+<main>
+    <!-- Saga --------------------------------------------------------------------------------------->
+    <section class="tab" id="tab-saga">
+        <aside class="rail">
+            <section class="block">
+                <h2>Run a scenario</h2>
+                <p class="hint">Each scenario creates a fresh customer and product, then places the order.</p>
+                <div class="scenarios" id="scenarios"></div>
+                <p class="note" id="scenario-note" aria-live="polite"></p>
+            </section>
+
+            <section class="block">
+                <h2>Place an order</h2>
+                <form id="order-form" class="form">
+                    <label>Customer <select name="customerId" required></select></label>
+                    <label>Product <select name="productId" required></select></label>
+                    <div class="row2">
+                        <label>Quantity <input name="quantity" type="number" min="1" value="1" required></label>
+                        <label>Amount <input name="amount" type="number" min="0.01" step="0.01" value="25.00" required></label>
+                    </div>
+                    <button type="submit" class="primary">Place order</button>
+                    <p class="error" id="order-error" aria-live="polite"></p>
+                </form>
+            </section>
+
+            <section class="block grow">
+                <h2>Recent orders</h2>
+                <ol class="orders" id="orders"></ol>
+            </section>
+        </aside>
+
+        <section class="detail" id="detail">
+            <div class="empty" id="detail-empty">
+                <p>Run a scenario or pick an order to watch its saga.</p>
+                <p class="hint">The map shows the states the saga passed through; the timeline shows every command and reply the services exchanged.</p>
+            </div>
+            <div id="detail-body" hidden>
+                <header class="order-head">
+                    <div>
+                        <h2 class="order-id" id="d-title"></h2>
+                        <p class="order-sub" id="d-sub"></p>
+                    </div>
+                    <span class="badge" id="d-status"></span>
+                </header>
+                <p class="reason" id="d-reason" hidden></p>
+
+                <figure class="map">
+                    <svg id="map" viewBox="0 0 900 280" role="img" aria-labelledby="map-title">
+                        <title id="map-title">Saga state machine with the path this order took</title>
+                    </svg>
+                    <figcaption class="legend">
+                        <span class="key fwd">forward step</span>
+                        <span class="key comp">compensation</span>
+                        <span class="key cur">current state</span>
+                    </figcaption>
+                </figure>
+
+                <div class="split">
+                    <section>
+                        <h3>Messages</h3>
+                        <div class="lanes-head"><span></span><span>order</span><span>payment</span><span>inventory</span></div>
+                        <ol class="timeline" id="timeline"></ol>
+                    </section>
+                    <section class="side">
+                        <h3>Saga</h3>
+                        <dl class="facts" id="saga-facts"></dl>
+                        <div id="intervene" hidden>
+                            <h4>Intervene</h4>
+                            <p class="hint">Retry re-sends the compensation now. Resolve closes the saga as failed: only do that after compensating by hand in the participant's database.</p>
+                            <form id="intervene-form" class="form">
+                                <label>Operator <input name="operator" required placeholder="your name"></label>
+                                <label>Note <input name="note" placeholder="required for resolve"></label>
+                                <div class="row2">
+                                    <button type="submit" name="action" value="retry">Retry compensation</button>
+                                    <button type="submit" name="action" value="resolve" class="danger">Resolve as failed</button>
+                                </div>
+                                <p class="error" id="intervene-error" aria-live="polite"></p>
+                            </form>
+                        </div>
+                        <ol class="history" id="history"></ol>
+
+                        <h3>Payment</h3>
+                        <dl class="facts" id="payment-facts"></dl>
+                        <h3>Inventory</h3>
+                        <dl class="facts" id="inventory-facts"></dl>
+                    </section>
+                </div>
+            </div>
+        </section>
+    </section>
+
+    <!-- Operations ---------------------------------------------------------------------------------->
+    <section class="tab" id="tab-ops" hidden>
+        <section class="block">
+            <h2>Compensations</h2>
+            <p class="hint">From order-service metrics, which it recalculates every 15 seconds, so these can trail the list below.</p>
+            <div class="tiles" id="tiles"></div>
+        </section>
+
+        <section class="block">
+            <h2>Stuck sagas</h2>
+            <p class="hint">Sagas whose refund or release keeps being re-sent without a reply. Open one to retry or resolve it.</p>
+            <table class="grid" id="stuck"></table>
+        </section>
+
+        <section class="block">
+            <h2>Dead-letter topics</h2>
+            <p class="hint">Messages that failed after all retries. Replay sends them back to their topic; fix the cause first.</p>
+            <div class="dlts" id="dlts"></div>
+        </section>
+
+        <div class="two">
+            <section class="block">
+                <h2>Inject a message</h2>
+                <p class="hint">Publishes straight onto a saga topic, skipping the outbox. Use the presets to see dead-lettering and replay.</p>
+                <div class="presets" id="presets"></div>
+                <form id="inject-form" class="form">
+                    <div class="row2">
+                        <label>Topic
+                            <select name="topic">
+                                <option>payment.commands</option>
+                                <option>inventory.commands</option>
+                                <option>order.saga.replies</option>
+                            </select>
+                        </label>
+                        <label>Message type <input name="messageType" required list="message-types"></label>
+                    </div>
+                    <datalist id="message-types">
+                        <option>ProcessPayment</option><option>RefundPayment</option>
+                        <option>ReserveInventory</option><option>ReleaseInventory</option>
+                        <option>PaymentProcessed</option><option>PaymentFailed</option><option>PaymentRefunded</option>
+                        <option>InventoryReserved</option><option>InventoryFailed</option><option>InventoryReleased</option>
+                    </datalist>
+                    <div class="row3">
+                        <label>Key <input name="key" placeholder="random"></label>
+                        <label>Partition <input name="partition" type="number" min="0" max="2" placeholder="by key"></label>
+                        <label>Count <input name="count" type="number" min="1" max="100" value="1"></label>
+                    </div>
+                    <label>Payload <textarea name="payload" rows="5" class="code" spellcheck="false"></textarea></label>
+                    <button type="submit" class="primary">Publish</button>
+                    <pre class="out" id="inject-out" hidden></pre>
+                </form>
+            </section>
+
+            <section class="block">
+                <h2>Demo a timeout and a stuck compensation</h2>
+                <ol class="steps">
+                    <li>For a quicker demo, start order-service with <code>--saga.timeout.payment=10s --saga.timeout.compensation=10s</code>.</li>
+                    <li>Stop payment-service. Its health dot turns red.</li>
+                    <li>Place an order. After the payment timeout the saga moves to <em>compensating</em> and keeps re-sending the refund.</li>
+                    <li>After three re-sends it appears under stuck sagas and the stuck tile goes up.</li>
+                    <li>Start payment-service again. The delayed charge goes through, then the refund queued behind it undoes it, and the order ends rejected with the credit unchanged.</li>
+                    <li>Or, while it is stuck, open the order and use <em>Retry compensation</em> or <em>Resolve as failed</em>.</li>
+                </ol>
+            </section>
+        </div>
+    </section>
+
+    <!-- Data ---------------------------------------------------------------------------------------->
+    <section class="tab" id="tab-data" hidden>
+        <div class="two">
+            <section class="block">
+                <h2>Customers</h2>
+                <form id="customer-form" class="form inline">
+                    <label>Customer id <input name="id" required pattern="[A-Za-z0-9._-]{1,100}"></label>
+                    <label>Credit <input name="value" type="number" min="0" step="0.01" required></label>
+                    <button type="submit">Save credit</button>
+                </form>
+                <p class="error" id="customer-error" aria-live="polite"></p>
+                <table class="grid" id="customers"></table>
+            </section>
+            <section class="block">
+                <h2>Products</h2>
+                <form id="product-form" class="form inline">
+                    <label>Product id <input name="id" required pattern="[A-Za-z0-9._-]{1,100}"></label>
+                    <label>Stock <input name="value" type="number" min="0" step="1" required></label>
+                    <button type="submit">Save stock</button>
+                </form>
+                <p class="error" id="product-error" aria-live="polite"></p>
+                <table class="grid" id="products"></table>
+            </section>
+        </div>
+    </section>
+
+    <!-- API console --------------------------------------------------------------------------------->
+    <section class="tab" id="tab-console" hidden>
+        <div class="console">
+            <aside class="catalogue" id="catalogue" aria-label="Endpoints"></aside>
+            <section class="block">
+                <form id="console-form" class="form">
+                    <div class="request-line">
+                        <select name="service" aria-label="Service">
+                            <option value="order">order</option>
+                            <option value="payment">payment</option>
+                            <option value="inventory">inventory</option>
+                            <option value="ui">console</option>
+                        </select>
+                        <select name="method" aria-label="Method">
+                            <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option>
+                        </select>
+                        <input name="path" class="code" aria-label="Path" value="/orders?limit=10" spellcheck="false">
+                        <button type="submit" class="primary">Send</button>
+                    </div>
+                    <label>Body <textarea name="body" rows="6" class="code" spellcheck="false" placeholder="JSON body for POST/PUT"></textarea></label>
+                </form>
+                <p class="response-meta" id="console-meta"></p>
+                <pre class="out" id="console-out" hidden></pre>
+            </section>
+        </div>
+    </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

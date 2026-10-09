@@ -44,4 +44,4 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,dlt
+        include: health,info,dlt,outbox

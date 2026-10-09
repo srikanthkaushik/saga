@@ -4,6 +4,8 @@ Commands are for Windows CMD against local ports: order 8081, payment 8082, inve
 
 > Actuator endpoints are **unauthenticated** until actuator security lands (see PROJECT.md). Don't expose these ports beyond trusted networks.
 
+> Everything below can also be done from the saga console (`java -jar saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar`, http://localhost:8080): **Operations** lists stuck sagas and DLTs with replay, and opening an order offers Retry and Resolve.
+
 ---
 
 ## SagaCompensationStuck (page)

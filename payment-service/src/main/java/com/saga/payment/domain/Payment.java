@@ -89,4 +89,12 @@ public class Payment {
     public PaymentStatus getStatus() {
         return status;
     }
+
+    public Instant getCreatedAt() {
+        return createdAt;
+    }
+
+    public Instant getUpdatedAt() {
+        return updatedAt;
+    }
 }

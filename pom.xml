@@ -22,6 +22,7 @@
         <module>order-service</module>
         <module>payment-service</module>
         <module>inventory-service</module>
+        <module>saga-ui</module>
         <module>saga-e2e</module>
     </modules>
 

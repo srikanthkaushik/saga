@@ -53,4 +53,4 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,dlt,metrics,prometheus,stucksagas
+        include: health,info,dlt,outbox,metrics,prometheus,stucksagas

@@ -21,6 +21,19 @@ public class CustomerCredit {
     protected CustomerCredit() {
     }
 
+    public CustomerCredit(String customerId, BigDecimal availableCredit) {
+        this.customerId = customerId;
+        setAvailableCredit(availableCredit);
+    }
+
+    /** Admin/test seeding only; saga processing goes through {@link #debit} and {@link #credit}. */
+    public void setAvailableCredit(BigDecimal availableCredit) {
+        if (availableCredit.signum() < 0) {
+            throw new IllegalArgumentException("Credit cannot be negative");
+        }
+        this.availableCredit = availableCredit;
+    }
+
     public boolean canAfford(BigDecimal amount) {
         return availableCredit.compareTo(amount) >= 0;
     }

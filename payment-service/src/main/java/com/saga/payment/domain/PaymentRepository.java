@@ -15,4 +15,6 @@ public interface PaymentRepository extends JpaRepository<Payment, UUID> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select p from Payment p where p.orderId = :orderId")
     Optional<Payment> findByOrderIdForUpdate(@Param("orderId") UUID orderId);
+
+    Optional<Payment> findByOrderId(UUID orderId);
 }

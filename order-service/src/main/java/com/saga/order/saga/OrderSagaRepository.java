@@ -13,6 +13,8 @@ public interface OrderSagaRepository extends JpaRepository<OrderSaga, UUID> {
 
     Optional<OrderSaga> findByOrderId(UUID orderId);
 
+    List<OrderSaga> findByOrderIdIn(List<UUID> orderIds);
+
     @Query(value = """
             select id from order_saga
             where deadline <= :now
