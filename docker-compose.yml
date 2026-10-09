@@ -22,7 +22,13 @@ services:
     container_name: saga-kafka
     ports:
       - "9092:9092"
+    volumes:
+      - saga-kafka-data:/var/lib/kafka/data
     environment:
+      # KRaft storage is formatted with this id on first start; a persisted log dir refuses a different one.
+      # Never change it without also removing the volume (docker compose down -v).
+      CLUSTER_ID: _i2hTKrTS761Uu_cNefu5Q
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       # Two client listeners: PLAINTEXT for apps on the host (localhost:9092),
@@ -58,3 +64,4 @@ services:
 
 volumes:
   saga-postgres-data:
+  saga-kafka-data:

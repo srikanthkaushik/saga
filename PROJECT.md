@@ -19,7 +19,7 @@ Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQ
 Each service owns its database (`order_db`, `payment_db`, `inventory_db`) on one Postgres instance. Other files:
 - `docker-compose.yml`: Postgres, Kafka and **AKHQ** (Kafka web UI at http://localhost:8086) for local runs.
   - Kafka advertises two client listeners: `localhost:9092` for host apps, and `kafka:29092` on the compose network (AKHQ).
-  - Kafka keeps no volume, so re-creating its container empties the topics.
+  - Kafka data lives in the named volume `saga-kafka-data` (`KAFKA_LOG_DIRS=/var/lib/kafka/data`, a pinned `CLUSTER_ID`). Topics, messages and offsets survive re-creation; only `down -v` wipes them, together with Postgres.
 - `docker\postgres\init.sql` (creates the three DBs)
 - `ops\prometheus\` (alert rules and promtool tests)
 - `ops\RUNBOOK.md` (operator procedures)
@@ -242,6 +242,7 @@ curl http://localhost:8081/orders/<id>
 - [x] Saga timeouts + ReleaseInventory compensation + tombstone fencing + listener concurrency 3
 - [x] Stuck-compensation alerting: metrics, Prometheus export, alert rules + promtool tests
 - [x] Manual resolution: retry/resolve with audit trail, saga detail view, operator runbook
+- [x] 2026-10-09: Kafka named volume + pinned CLUSTER_ID. Verified that topics, message counts and committed offsets are identical after `--force-recreate`, and orders keep flowing.
 - [x] 2026-10-09: AKHQ 0.28.0 Kafka UI in docker-compose (port 8086) plus a `DOCKER` listener on Kafka for container clients. Verified against Kafka 4.0: topics, counts, lag, DLT records with headers, and groups (3 members each).
 - [x] 2026-10-09: saga console (`saga-ui`) + read/seed APIs + outbox endpoint.
   - Checked in headless Chrome over CDP: every scenario renders the right status, map route and message count; ops tiles, DLT replay, inject, data save, API console, deep links and intervene (resolve without a note is refused; retry completes the saga) all work, with no JS errors.

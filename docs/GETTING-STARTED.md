@@ -56,7 +56,16 @@ This starts three containers:
 | `saga-kafka` | Kafka 4.0, KRaft mode, a single broker | `localhost:9092` from the host; `kafka:29092` from other containers |
 | `saga-akhq` | [AKHQ](https://akhq.io) 0.28.0, a web UI for Kafka | http://localhost:8086 |
 
-On first start, `docker\postgres\init.sql` creates the three databases `order_db`, `payment_db` and `inventory_db`. Postgres data persists in the Docker volume `saga_saga-postgres-data`. **Kafka has no volume:** whenever the `saga-kafka` container is re-created (for example after a change to `docker-compose.yml`), topics and messages start empty. The services recreate their topics when they start.
+On first start, `docker\postgres\init.sql` creates the three databases `order_db`, `payment_db` and `inventory_db`. Data survives container re-creation, `docker compose down` and restarts. It lives in two named volumes:
+
+| Volume | Holds |
+|---|---|
+| `saga_saga-postgres-data` | the three databases |
+| `saga_saga-kafka-data` | Kafka's topics, messages and committed consumer offsets |
+
+Only `docker compose down -v` deletes them.
+
+Kafka's storage is formatted on first start with the `CLUSTER_ID` set in `docker-compose.yml`. **Don't change that id while the volume exists:** Kafka refuses to start on storage formatted for a different cluster. If you need a new id, wipe first ([section 6](#6-stop-and-reset)).
 
 Kafka has two client listeners because "localhost" means something different in each place:
 - `localhost:9092` for the services on your machine;
@@ -147,8 +156,10 @@ The backoff for every service is set with `--saga.kafka.retry.max-retries=4 --sa
 | Goal | Do |
 |---|---|
 | Stop a service | Close its window, or press Ctrl+C in it |
-| Stop infrastructure, keep data | `docker compose down` |
-| **Wipe everything** (databases and Kafka topics) | `docker compose down -v`, then `docker compose up -d` and restart the services so Flyway recreates the schema |
+| Stop infrastructure, keep data | `docker compose down`. Databases, topics, messages and consumer offsets all survive |
+| **Wipe everything** (databases and Kafka) | `docker compose down -v`, then `docker compose up -d` and restart the services so Flyway recreates the schema and the services recreate their topics |
+
+Wipe Postgres and Kafka **together**. If you clear only one, the other still refers to sagas that no longer exist. For example, replies left in Kafka for sagas missing from `order_db` would be dead-lettered as "Unknown saga".
 
 ## 7. Run the tests
 
@@ -237,6 +248,8 @@ Every endpoint is listed, with examples, in the console's **API console** tab. T
 | The console shows `… unreachable` | That service isn't running on the port the console expects (`saga.ui.services.*`) |
 | The stuck tile shows 0 although `stucksagas` lists one | The gauges refresh every 15 s by default (`saga.alert.refresh-interval`) |
 | AKHQ at http://localhost:8086 shows no cluster, or times out | `docker compose ps` should show `saga-akhq` as healthy, and `docker logs saga-akhq` should not show connection errors. AKHQ must reach Kafka at `kafka:29092` (the `DOCKER` listener), not `localhost:9092` |
-| Topics in AKHQ are empty after editing `docker-compose.yml` | The Kafka container was re-created, and it keeps no data. Restart the services to recreate their topics |
+| Topics in AKHQ are empty | Kafka was wiped (`docker compose down -v`) and the services haven't been started since. Starting them recreates their topics |
+| Kafka won't start and logs `Invalid cluster.id` | `CLUSTER_ID` in `docker-compose.yml` no longer matches the formatted storage. Restore the old id, or wipe with `docker compose down -v` |
+| `DUPLICATE_BROKER_REGISTRATION` INFO lines right after Kafka restarts | The controller still holds the previous incarnation's session for a few seconds. Harmless; it registers on its own |
 | A JWT "SECURITY WARNING" banner in `docker logs saga-akhq` | AKHQ's notice that it runs without authentication. Expected locally |
 | In Git Bash, `docker exec … /opt/kafka/bin/…` fails with a `C:/Program Files/Git/opt/...` path | Git Bash rewrites the path. Use CMD, or prefix the command with `MSYS_NO_PATHCONV=1` |
