@@ -225,11 +225,20 @@ curl http://localhost:8082/actuator/dlt/payment.commands
 - **The unknown type:** one attempt, dead-lettered in the same second.
 - **The crash:** 5 attempts with gaps of 0.5, 1, 2 and 4 s, then dead-lettered.
 
-**Read the dead letters** with their headers:
+**Read the dead letters** with their headers. The easy way is AKHQ:
+1. Open http://localhost:8086 → **Topics**. `payment.commands-dlt` now shows a count of 2.
+2. Click it → **Data**, and set **Sort: NEWEST**.
+3. Click the number in the **Headers** column of a record.
+
+From the command line:
 ```
 docker exec saga-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic payment.commands-dlt --from-beginning --property print.headers=true --property print.key=true --timeout-ms 5000
 ```
-Each record keeps its original `messageId`, `messageType`, key and value. Spring adds `kafka_dlt-exception-cause-fqcn` (e.g. `java.lang.NullPointerException`), `kafka_dlt-exception-message`, `kafka_dlt-original-topic` and a stack trace. The output is long; the useful part is at the start of each line.
+Each record keeps its original `messageId`, `messageType`, key and value. Spring adds:
+- `kafka_dlt-exception-cause-fqcn` (e.g. `java.lang.NullPointerException`)
+- `kafka_dlt-exception-message`
+- `kafka_dlt-original-topic`
+- a stack trace (on the command line the output is long; the useful part is at the start of each line)
 
 **Why:**
 - [`KafkaErrorHandlingConfig`](../saga-common/src/main/java/com/saga/common/kafka/KafkaErrorHandlingConfig.java) sets up the backoff (`saga.kafka.retry.*`) and marks `NonRetryableMessageException` and `JacksonException` as not retryable.
@@ -452,7 +461,8 @@ Now start payment-service again.
 | Question | Look at |
 |---|---|
 | What happened to this order? | Console order detail, or `GET /actuator/outbox/{orderId}` on all three services (commands from order-service, replies from the participants) |
-| Is a message stuck? | `GET /actuator/dlt` on each service. Kafka lag: `kafka-consumer-groups.sh --describe --group <service>` ([Getting started §8](GETTING-STARTED.md#kafka)) |
+| What is actually on the topics? | AKHQ at http://localhost:8086: messages, headers, Live Tail, search by key (orderId) ([Getting started §8](GETTING-STARTED.md#kafka-in-the-browser-akhq)) |
+| Is a message stuck? | `GET /actuator/dlt` on each service. Kafka lag: AKHQ's **Consumer Groups**, or `kafka-consumer-groups.sh --describe --group <service>` ([Getting started §8](GETTING-STARTED.md#kafka-from-the-command-line)) |
 | Is any compensation stuck? | `GET /actuator/stucksagas`, the gauge `saga.compensation.stuck`, the log line `STUCK COMPENSATION` |
 | Which metrics exist? | `curl http://localhost:8081/actuator/metrics`, and `curl http://localhost:8081/actuator/prometheus \| findstr saga_` |
 | Will the alerts fire correctly? | Run the promtool tests: `docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prometheus test rules /rules/saga-alerts.test.yml` → `SUCCESS` |

@@ -22,7 +22,7 @@ Everything here is for **Windows Command Prompt (CMD)**. All commands run from t
 | curl | ships with Windows 10+ | `curl --version` |
 | A browser | – | for the console at http://localhost:8080 |
 
-Ports that must be free: **5432** (Postgres), **9092** (Kafka), **8080–8083** (console and services). Check one with `netstat -ano | findstr :8081`.
+Ports that must be free: **5432** (Postgres), **9092** (Kafka), **8080–8083** (console and services), **8086** (AKHQ Kafka UI). Check one with `netstat -ano | findstr :8081`.
 
 ## 2. Build
 
@@ -48,7 +48,21 @@ saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
 docker compose up -d
 docker compose ps
 ```
-This starts `saga-postgres` (Postgres 17, user `saga` / password `saga`) and `saga-kafka` (Kafka 4.0 in KRaft mode, a single broker). On first start, `docker\postgres\init.sql` creates the three databases `order_db`, `payment_db` and `inventory_db`. Data persists in the Docker volume `saga_saga-postgres-data`.
+This starts three containers:
+
+| Container | What | Reach it at |
+|---|---|---|
+| `saga-postgres` | Postgres 17, user `saga` / password `saga` | `localhost:5432` |
+| `saga-kafka` | Kafka 4.0, KRaft mode, a single broker | `localhost:9092` from the host; `kafka:29092` from other containers |
+| `saga-akhq` | [AKHQ](https://akhq.io) 0.28.0, a web UI for Kafka | http://localhost:8086 |
+
+On first start, `docker\postgres\init.sql` creates the three databases `order_db`, `payment_db` and `inventory_db`. Postgres data persists in the Docker volume `saga_saga-postgres-data`. **Kafka has no volume:** whenever the `saga-kafka` container is re-created (for example after a change to `docker-compose.yml`), topics and messages start empty. The services recreate their topics when they start.
+
+Kafka has two client listeners because "localhost" means something different in each place:
+- `localhost:9092` for the services on your machine;
+- `kafka:29092` on the compose network, for AKHQ.
+
+A container told to use `localhost:9092` would try to connect to itself.
 
 ### 3.2 Services
 Each command opens its own window, so you can watch the logs:
@@ -180,7 +194,21 @@ docker exec saga-postgres psql -U saga -d inventory_db -c "select * from product
 docker exec saga-postgres psql -U saga -d order_db -c "select message_type, published_at is not null as sent, created_at from outbox order by created_at desc limit 10;"
 ```
 
-### Kafka
+### Kafka in the browser: AKHQ
+Open **http://localhost:8086** (cluster `saga-local`).
+
+| To see | In AKHQ |
+|---|---|
+| All topics with message counts, size, last record and the lag of each consuming group | **Topics** (the start page) |
+| The messages on a topic, newest first, with key, partition and offset | Click a topic → **Data**. Set **Sort: NEWEST** |
+| A message's headers (`messageId`, `messageType`, and for dead letters every `kafka_dlt-*` header) | In **Data**, click the number in the **Headers** column |
+| Messages for one order | **Data** → **Search** by key: the orderId |
+| Messages as they arrive | **Live Tail** (bottom of a topic page) |
+| Consumer groups, members (3 per service, one per partition) and lag per partition | **Consumer Groups** |
+
+AKHQ here is **read-write and unauthenticated**. It can also produce, copy and empty topics, and reset consumer-group offsets. That's handy locally (e.g. emptying a DLT after you've dealt with it), but don't expose it beyond your machine. To re-send dead letters, prefer the services' own `dlt` replay endpoint ([Scenario 7](SCENARIOS.md#scenario-7--fix-the-cause-then-replay-the-dead-letter)): it strips the `kafka_dlt-*` headers and tracks what was already replayed.
+
+### Kafka from the command line
 The Kafka command-line tools live inside the container, at `/opt/kafka/bin`:
 ```
 docker exec saga-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
@@ -208,4 +236,7 @@ Every endpoint is listed, with examples, in the console's **API console** tab. T
 | An order stays `PENDING` | A participant is down or a message is stuck. Check health, then `GET /actuator/dlt` on each service and the service windows for `Delivery attempt … failed`. With default settings the saga times out and compensates after 30 s |
 | The console shows `… unreachable` | That service isn't running on the port the console expects (`saga.ui.services.*`) |
 | The stuck tile shows 0 although `stucksagas` lists one | The gauges refresh every 15 s by default (`saga.alert.refresh-interval`) |
+| AKHQ at http://localhost:8086 shows no cluster, or times out | `docker compose ps` should show `saga-akhq` as healthy, and `docker logs saga-akhq` should not show connection errors. AKHQ must reach Kafka at `kafka:29092` (the `DOCKER` listener), not `localhost:9092` |
+| Topics in AKHQ are empty after editing `docker-compose.yml` | The Kafka container was re-created, and it keeps no data. Restart the services to recreate their topics |
+| A JWT "SECURITY WARNING" banner in `docker logs saga-akhq` | AKHQ's notice that it runs without authentication. Expected locally |
 | In Git Bash, `docker exec … /opt/kafka/bin/…` fails with a `C:/Program Files/Git/opt/...` path | Git Bash rewrites the path. Use CMD, or prefix the command with `MSYS_NO_PATHCONV=1` |

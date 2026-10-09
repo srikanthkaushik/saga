@@ -72,7 +72,8 @@ Every arrow between services is a Kafka topic: 3 partitions, keyed by orderId, w
 | inventory-service | 8083 | Executes ReserveInventory / ReleaseInventory |
 | saga-ui | 8080 (localhost only) | Browser console. Proxies to the services and injects raw Kafka messages |
 | PostgreSQL 17 | 5432 | One instance, three databases (`order_db`, `payment_db`, `inventory_db`), one per service |
-| Kafka 4.0 (KRaft) | 9092 | Three topics plus three dead-letter topics |
+| Kafka 4.0 (KRaft) | 9092 (host), 29092 (compose network) | Three topics plus three dead-letter topics |
+| AKHQ 0.28.0 | 8086 | Kafka web UI for local development: topics, messages and headers, consumer groups and lag. Not part of the saga |
 | saga-common | – | A library jar used by all three services (not a process) |
 
 **Topics**

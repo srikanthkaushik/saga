@@ -122,6 +122,7 @@ Each service only sees and replays its own DLT:
 curl http://localhost:8082/actuator/dlt
 curl -X POST http://localhost:8082/actuator/dlt/payment.commands -H "Content-Type: application/json" -d "{\"limit\":50}"
 ```
+To look at what was dead-lettered and why (local stack), open AKHQ at http://localhost:8086 → topic `<topic>-dlt` → **Data**, and click the **Headers** count of a record. `kafka_dlt-exception-cause-fqcn` and `kafka_dlt-exception-message` give the cause. Re-send with the replay endpoint above, **not** AKHQ's produce/copy: the endpoint strips the `kafka_dlt-*` headers and tracks what has already been replayed.
 - **Before replaying, fix the cause.** The `Dead-lettered … : <exception>` ERROR line names it. A record that fails again returns to the DLT with `dltReplayCount` incremented.
 - **Replay is safe to repeat.** Each record keeps its `messageId`, so consumers skip anything already processed.
 - **Commands for finished sagas are refused safely.** Replaying a charge or reservation for a saga that has already been compensated hits the tombstone and is refused. That's expected, not an error.

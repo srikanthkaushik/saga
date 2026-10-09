@@ -17,7 +17,9 @@ Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQ
 | `saga-e2e` | random | Testcontainers end-to-end tests that run the real service and console jars as child processes |
 
 Each service owns its database (`order_db`, `payment_db`, `inventory_db`) on one Postgres instance. Other files:
-- `docker-compose.yml` (Postgres + Kafka for local runs)
+- `docker-compose.yml`: Postgres, Kafka and **AKHQ** (Kafka web UI at http://localhost:8086) for local runs.
+  - Kafka advertises two client listeners: `localhost:9092` for host apps, and `kafka:29092` on the compose network (AKHQ).
+  - Kafka keeps no volume, so re-creating its container empties the topics.
 - `docker\postgres\init.sql` (creates the three DBs)
 - `ops\prometheus\` (alert rules and promtool tests)
 - `ops\RUNBOOK.md` (operator procedures)
@@ -201,6 +203,7 @@ curl http://localhost:8081/orders/<id>
 ```
 - Seed data: `customer-1` has 1000.00 credit and `customer-2` 50.00. `product-1` has qty 100; `product-2` has qty 0, which forces a compensation.
 - Operator commands (DLT replay, stuck sagas, retry/resolve) are in `ops\RUNBOOK.md`; the console does the same from its Operations tab.
+- **Kafka UI:** AKHQ at http://localhost:8086 (cluster `saga-local`; started by `docker compose up -d`). It's read-write and unauthenticated (local only). Replay DLTs with the `dlt` endpoint, not AKHQ's produce or copy.
 - **Editing the console:** to work on the UI without rebuilding, start it with `--spring.web.resources.static-locations=file:saga-ui/src/main/resources/static/ --spring.web.resources.cache.period=0` and refresh the browser.
 - **Faster timeout demo:** start order-service with `--saga.timeout.payment=10s --saga.timeout.compensation=10s`.
 
@@ -239,6 +242,7 @@ curl http://localhost:8081/orders/<id>
 - [x] Saga timeouts + ReleaseInventory compensation + tombstone fencing + listener concurrency 3
 - [x] Stuck-compensation alerting: metrics, Prometheus export, alert rules + promtool tests
 - [x] Manual resolution: retry/resolve with audit trail, saga detail view, operator runbook
+- [x] 2026-10-09: AKHQ 0.28.0 Kafka UI in docker-compose (port 8086) plus a `DOCKER` listener on Kafka for container clients. Verified against Kafka 4.0: topics, counts, lag, DLT records with headers, and groups (3 members each).
 - [x] 2026-10-09: saga console (`saga-ui`) + read/seed APIs + outbox endpoint.
   - Checked in headless Chrome over CDP: every scenario renders the right status, map route and message count; ops tiles, DLT replay, inject, data save, API console, deep links and intervene (resolve without a note is refused; retry completes the saga) all work, with no JS errors.
   - That browser check is a one-off script and is **not** in the repo.

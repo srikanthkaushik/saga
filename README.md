@@ -54,7 +54,7 @@ start "console"   java -jar saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
 start http://localhost:8080
 ```
 
-In the console, click **Happy path**, then **Out of stock**, and compare the two routes on the state map.
+In the console, click **Happy path**, then **Out of stock**, and compare the two routes on the state map. To see the raw Kafka messages behind them, open **AKHQ** at http://localhost:8086; `docker compose up -d` starts it along with Postgres and Kafka.
 
 ## Documentation
 
@@ -79,7 +79,7 @@ inventory-service/  reserves and releases stock
 saga-ui/            browser console (proxy + Kafka message injector + single-page UI)
 saga-e2e/           Testcontainers end-to-end tests that run the real jars
 ops/                Prometheus alert rules (+ tests) and the operator runbook
-docker/, docker-compose.yml   local Postgres and Kafka
+docker/, docker-compose.yml   local Postgres, Kafka and AKHQ (Kafka web UI on :8086)
 ```
 
 > **Not production-ready yet:** actuator endpoints and the credit/stock seed endpoints are unauthenticated, and the console is a local dev tool. See "Next / open" in [PROJECT.md](PROJECT.md).
