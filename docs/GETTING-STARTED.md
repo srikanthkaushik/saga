@@ -165,6 +165,8 @@ shows `"status":"APPROVED"` and `"sagaState":"COMPLETED"`.
 
 Now go to [Scenarios](SCENARIOS.md) and work through them in order.
 
+> To run the whole stack on another machine (e.g. an Unraid server) from Docker images instead of local jars, see [Deploy on Unraid](../deploy/unraid/README.md).
+
 ## 6. Configuration overrides
 
 Any property can be overridden on the command line with `--name=value` after the jar name. The defaults are listed in [PROJECT.md › Configuration](../PROJECT.md#configuration-applicationyml-defaults-shown). The most useful ones for exploring:

@@ -1,0 +1,4 @@
+# Build context for the images in docker/: only the packaged jars and the docker/ files are needed
+**
+!*/target/*-0.0.1-SNAPSHOT.jar
+!docker/

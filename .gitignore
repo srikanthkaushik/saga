@@ -16,3 +16,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Deployment settings with secrets
+.env

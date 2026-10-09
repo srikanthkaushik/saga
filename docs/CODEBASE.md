@@ -182,7 +182,11 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 |---|---|
 | `*/src/main/resources/application.yml` | Ports, datasource, Kafka, retry, timeout and alert settings, exposed actuator endpoints |
 | `*/src/main/resources/db/migration/V*__*.sql` | Flyway migrations, per service (listed in [PROJECT.md](../PROJECT.md#database-migrations-flyway)) |
-| `docker-compose.yml`, `docker/postgres/init.sql` | Local Postgres and Kafka |
+| `docker-compose.yml`, `docker/postgres/init.sql` | Local development infrastructure: Postgres, Kafka, AKHQ, Keycloak |
+| `docker/keycloak/saga-realm.json` | The `saga` realm (roles, clients, dev users). `${VAR:default}` placeholders let a deployment set the console URL, secrets and passwords |
+| `docker/app.Dockerfile`, `docker/keycloak/Dockerfile`, `docker/postgres/Dockerfile`, `.dockerignore` | Deployment images: one layered, non-root image per Spring Boot module; Keycloak with the realm baked in; Postgres with the init script |
+| `ops/images.cmd` | Package + build the six images, optionally push (`SAGA_REGISTRY`, default `ghcr.io/srikanthkaushik`) |
+| `deploy/unraid/` | `docker-compose.yml`, `.env.example` and guide for running the stack from images (Unraid Compose Manager or any Docker host) |
 | `ops/prometheus/saga-alerts.yml`, `saga-alerts.test.yml` | Alert rules and their promtool tests |
 | `ops/RUNBOOK.md` | Operator procedures |
 

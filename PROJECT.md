@@ -190,6 +190,20 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 | inventory | V2 | `reservation.status`, `released_at` |
 | order V5 / payment V3 / inventory V3 | – | `outbox(message_key)` index for the outbox endpoint |
 
+## Deployment (Unraid / any Docker host)
+Guide: [`deploy/unraid/README.md`](deploy/unraid/README.md).
+- **Images** (`ops\images.cmd <tag> [push]` → `ghcr.io/srikanthkaushik/saga-*`):
+  - the three services and the console from one layered, non-root `docker/app.Dockerfile` (an app update re-pushes about 340 kB; the 91 MB dependency layer is cached);
+  - `saga-keycloak` with the realm baked in;
+  - `saga-postgres` with the init script.
+- **The stack:** `deploy/unraid/docker-compose.yml` plus `.env`. One setting, `SAGA_HOST`, drives Keycloak's public URL (`KC_HOSTNAME`, so the token issuer), the console's redirect URI and Kafka's external listener.
+  - Containers talk over the compose network: `kafka:29092`, `postgres:5432`, `order-service:8081`, …
+  - Keycloak is reached at `http://SAGA_HOST:KEYCLOAK_PORT` by browsers and containers alike.
+  - Data lives in `APPDATA` bind mounts; a `kafka-init` container chowns the Kafka folder for uid 1000.
+  - Start order is enforced by healthchecks.
+- **Realm placeholders** `${VAR:default}` (console URL, client secrets, user passwords): set by the deployment, falling back to the dev values for local runs and e2e. This form is undocumented but verified on Keycloak 26.7.0, hence the pinned image.
+- **Rehearsed locally** with `SAGA_HOST=host.docker.internal` (Chrome and curl mapped it to 127.0.0.1): clean first start 8/8 healthy, `.env` passwords enforced, the 12-check browser login suite passed over a non-secure origin, and data survived `down` and `up`.
+
 ## Boot 4 gotchas (verified)
 - Starters: `spring-boot-starter-webmvc` (not `-web`), `spring-boot-starter-kafka`, and `spring-boot-starter-flyway` + `flyway-database-postgresql`. Prometheus export: `io.micrometer:micrometer-registry-prometheus`.
 - Jackson 3: inject `tools.jackson.databind.json.JsonMapper`. Exceptions are unchecked, and `JsonNode.asText()` is now `asString()`.
@@ -207,6 +221,10 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 - **With a `GrantedAuthoritiesMapper`, the mapped roles are on the `Authentication`**, not on the `OidcUser` principal. `@AuthenticationPrincipal OidcUser#getAuthorities()` returns the unmapped ones.
 - **The OAuth2 client resolves `issuer-uri` at startup,** so the console fails to start while Keycloak is down. Resource servers resolve it lazily, on the first token.
 - **Keycloak 26:** bootstrap admin is `KC_BOOTSTRAP_ADMIN_USERNAME/PASSWORD`; `start-dev --import-realm` skips realms that already exist; users need first name, last name and email, or the login asks for them (and the password grant fails).
+- **Postgres healthcheck must use TCP** (`pg_isready -h 127.0.0.1`). During first-start initialisation Postgres listens only on its Unix socket, so a socket check reports ready while other containers' connections are refused.
+- **`crypto.randomUUID` exists only in secure contexts** (HTTPS or localhost). A LAN deployment over plain HTTP isn't one, so the console falls back to `crypto.getRandomValues`.
+- **Keycloak over plain HTTP on a non-localhost address** sets its login cookies `SameSite=Lax` without `Secure`, so browser login works on a LAN. `KC_HOSTNAME=http://host:port` fixes the issuer regardless of the address used.
+- **Docker Desktop doesn't serve published ports on the Wi-Fi LAN IP** (neither from the host nor from containers); `host.docker.internal` reaches the host from containers. This doesn't apply to Unraid.
 - **Keycloak login cookies are `Secure; SameSite=None`.** Browsers send them to `http://localhost`, but `java.net.CookieManager` does not. The e2e login client strips `Secure` (`ConsoleSession.LocalhostCookies`).
 
 ## Run (CMD)
@@ -269,6 +287,7 @@ curl http://localhost:8081/orders/<id>
 - [x] Saga timeouts + ReleaseInventory compensation + tombstone fencing + listener concurrency 3
 - [x] Stuck-compensation alerting: metrics, Prometheus export, alert rules + promtool tests
 - [x] Manual resolution: retry/resolve with audit trail, saga detail view, operator runbook
+- [x] 2026-10-09: **Deployment images + Unraid stack**: 6 images, `ops\images.cmd`, `deploy/unraid` compose + `.env` + guide; realm placeholders; console works over plain-HTTP LAN origins. Rehearsed locally end to end.
 - [x] 2026-10-09: **Security**: Keycloak 26.7 + OAuth2/JWT resource servers + console OIDC login with token relay and CSRF + role-aware UI + `ops\token.cmd` + Prometheus client credentials. 27 e2e tests green, plus a headless-Chrome login check per role.
 - [x] 2026-10-09: Kafka named volume + pinned CLUSTER_ID. Verified that topics, message counts and committed offsets are identical after `--force-recreate`, and orders keep flowing.
 - [x] 2026-10-09: AKHQ 0.28.0 Kafka UI in docker-compose (port 8086) plus a `DOCKER` listener on Kafka for container clients. Verified against Kafka 4.0: topics, counts, lag, DLT records with headers, and groups (3 members each).

@@ -70,6 +70,7 @@ Read in this order if you are new:
 | [Scenarios](docs/SCENARIOS.md) | A hands-on lab of 14 scenarios, from the happy path to stuck compensations, each with steps, expected results and the code responsible |
 | [Codebase tour](docs/CODEBASE.md) | Modules, packages, one order traced through the classes, where everything lives, how to extend it |
 | [Runbook](ops/RUNBOOK.md) | Operator procedures for alerts, stuck sagas and dead letters |
+| [Deploy on Unraid](deploy/unraid/README.md) | Run the whole stack on a home server (or any Docker host) from published images |
 | [Project log](PROJECT.md) | Status, decisions, configuration and endpoint reference, Boot 4 gotchas, open work |
 
 ## Repository layout
@@ -81,7 +82,8 @@ payment-service/    charges and refunds customer credit
 inventory-service/  reserves and releases stock
 saga-ui/            browser console (proxy + Kafka message injector + single-page UI)
 saga-e2e/           Testcontainers end-to-end tests that run the real jars
-ops/                Prometheus alert rules (+ tests) and the operator runbook
+ops/                Prometheus alert rules (+ tests), operator runbook, token and image scripts
+deploy/unraid/      docker-compose.yml + .env for running the whole stack from images
 docker/, docker-compose.yml   local Postgres, Kafka, AKHQ (Kafka web UI on :8086) and Keycloak (:8180, realm in docker/keycloak/)
 ```
 

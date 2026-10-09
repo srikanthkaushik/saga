@@ -35,13 +35,13 @@
       "name": "Saga console",
       "enabled": true,
       "publicClient": false,
-      "secret": "saga-console-dev-secret",
+      "secret": "${SAGA_CONSOLE_CLIENT_SECRET:saga-console-dev-secret}",
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "redirectUris": ["http://localhost:8080/*"],
+      "redirectUris": ["${SAGA_CONSOLE_URL:http://localhost:8080}/*"],
       "webOrigins": ["+"],
-      "attributes": { "post.logout.redirect.uris": "http://localhost:8080/*" },
+      "attributes": { "post.logout.redirect.uris": "${SAGA_CONSOLE_URL:http://localhost:8080}/*" },
       "protocolMappers": [
         {
           "name": "realm roles as roles",
@@ -91,7 +91,7 @@
       "name": "Prometheus scraper (client credentials)",
       "enabled": true,
       "publicClient": false,
-      "secret": "saga-prometheus-dev-secret",
+      "secret": "${SAGA_PROMETHEUS_CLIENT_SECRET:saga-prometheus-dev-secret}",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": true,
@@ -122,7 +122,7 @@
       "lastName": "Viewer",
       "email": "viewer@saga.local",
       "emailVerified": true,
-      "credentials": [{ "type": "password", "value": "viewer", "temporary": false }],
+      "credentials": [{ "type": "password", "value": "${SAGA_VIEWER_PASSWORD:viewer}", "temporary": false }],
       "realmRoles": ["saga-viewer"]
     },
     {
@@ -132,7 +132,7 @@
       "lastName": "Operator",
       "email": "operator@saga.local",
       "emailVerified": true,
-      "credentials": [{ "type": "password", "value": "operator", "temporary": false }],
+      "credentials": [{ "type": "password", "value": "${SAGA_OPERATOR_PASSWORD:operator}", "temporary": false }],
       "realmRoles": ["saga-operator"]
     },
     {
@@ -142,7 +142,7 @@
       "lastName": "Admin",
       "email": "admin@saga.local",
       "emailVerified": true,
-      "credentials": [{ "type": "password", "value": "admin", "temporary": false }],
+      "credentials": [{ "type": "password", "value": "${SAGA_ADMIN_PASSWORD:admin}", "temporary": false }],
       "realmRoles": ["saga-admin"]
     },
     {
