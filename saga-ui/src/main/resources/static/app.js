@@ -271,9 +271,9 @@ async function runScenario(sc) {
         const customerId = `${sc.key}-${suffix}`;
         const productId = `${sc.key}-${suffix}`;
         const customer = await call('payment', 'PUT', `/customers/${customerId}`, { availableCredit: sc.credit });
-        if (!customer.ok) throw new Error(`Could not create the customer: ${errorText(customer)}`);
+        if (!customer.ok) throw new Error(setupError('payment', 'customer', customer));
         const product = await call('inventory', 'PUT', `/products/${productId}`, { availableQuantity: sc.stock });
-        if (!product.ok) throw new Error(`Could not create the product: ${errorText(product)}`);
+        if (!product.ok) throw new Error(setupError('inventory', 'product', product));
 
         const body = { customerId, productId, quantity: sc.quantity, amount: sc.amount };
         const results = await Promise.all(Array.from({ length: sc.count }, () => call('order', 'POST', '/orders', body)));
@@ -291,17 +291,54 @@ async function runScenario(sc) {
     }
 }
 
-async function loadOrderOptions() {
-    const [customers, products] = await Promise.all([get('payment', '/customers'), get('inventory', '/products')]);
-    const form = $('#order-form');
-    fillSelect(form.customerId, customers.ok ? customers.data.map((c) => [c.customerId, `${c.customerId} (credit ${money(c.availableCredit)})`]) : []);
-    fillSelect(form.productId, products.ok ? products.data.map((p) => [p.productId, `${p.productId} (stock ${p.availableQuantity})`]) : []);
+/*
+ * The order form's suggestions come from payment- and inventory-service. They are remembered (also across a
+ * reload), so the form keeps working while one of them is down - which is exactly when you want to place an
+ * order and watch the saga time out and compensate. Ids can always be typed in.
+ */
+const OPTIONS_KEY = 'saga-console-order-options';
+
+function rememberedOptions() {
+    try { return JSON.parse(localStorage.getItem(OPTIONS_KEY)) || {}; } catch { return {}; }
 }
 
-function fillSelect(select, options) {
-    const current = select.value;
-    select.replaceChildren(...options.map(([value, label]) => h('option', { value, text: label })));
-    if (options.some(([value]) => value === current)) select.value = current;
+async function loadOrderOptions() {
+    const [customers, products] = await Promise.all([get('payment', '/customers'), get('inventory', '/products')]);
+    const known = rememberedOptions();
+    const notes = [];
+    if (customers.ok) {
+        known.customers = customers.data.map((c) => [c.customerId, `credit ${money(c.availableCredit)}`]);
+    } else {
+        notes.push(`payment-service is unavailable, so the customer suggestions are ${known.customers ? 'from earlier' : 'empty'}`);
+    }
+    if (products.ok) {
+        known.products = products.data.map((p) => [p.productId, `stock ${p.availableQuantity}`]);
+    } else {
+        notes.push(`inventory-service is unavailable, so the product suggestions are ${known.products ? 'from earlier' : 'empty'}`);
+    }
+    try { localStorage.setItem(OPTIONS_KEY, JSON.stringify(known)); } catch { /* storage unavailable */ }
+
+    fillOptions($('#customer-options'), known.customers || []);
+    fillOptions($('#product-options'), known.products || []);
+    const form = $('#order-form');
+    if (!form.customerId.value && known.customers && known.customers.length) form.customerId.value = known.customers[0][0];
+    if (!form.productId.value && known.products && known.products.length) form.productId.value = known.products[0][0];
+    $('#order-options-note').textContent = notes.length
+        ? `${notes.join('; ')}. You can still type an id (e.g. customer-1, product-1) and place the order.`
+        : '';
+}
+
+function fillOptions(datalist, options) {
+    datalist.replaceChildren(...options.map(([value, label]) => h('option', { value, label })));
+}
+
+/** Scenario set-up talks to payment- and inventory-service; when one is down, say what to do instead. */
+function setupError(service, what, result) {
+    if (result.status === 502) {
+        return `${service}-service is down, so this scenario can't create its ${what}. To watch the saga handle the outage, `
+            + 'place an order for an existing customer and product under "Place an order" (for example customer-1 and product-1).';
+    }
+    return `Could not create the ${what}: ${errorText(result)}`;
 }
 
 async function placeOrder(event) {

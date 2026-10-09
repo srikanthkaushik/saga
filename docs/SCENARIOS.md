@@ -297,6 +297,7 @@ curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8081/actuator/d
    ```
    curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":1,\"amount\":30.00}"
    ```
+   In the console, use **Place an order** (not a scenario button: those first create a customer and product, which needs the stopped service). The form keeps its customer and product suggestions while a service is down, and you can type ids.
 3. Watch it in the console (or poll `curl http://localhost:8081/orders/%ORDER%`):
 
    | after | sagaState | order window |
@@ -340,6 +341,7 @@ The result:
    ```
    curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":3,\"amount\":60.00}"
    ```
+   In the console, use **Place an order** (not a scenario button: those first create a customer and product, which needs the stopped service). The form keeps its customer and product suggestions while a service is down, and you can type ids.
 3. Within a few seconds the saga is INVENTORY_PENDING and alice has been charged. After about 10 s it moves to **RELEASING_INVENTORY**, and ReleaseInventory is re-sent every 10 s.
 4. Start inventory-service again: `start "inventory" java -jar inventory-service\target\inventory-service-0.0.1-SNAPSHOT.jar`.
 
