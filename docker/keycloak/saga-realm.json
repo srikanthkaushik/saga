@@ -1,0 +1,155 @@
+{
+  "realm": "saga",
+  "displayName": "Saga (local development)",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "roles": {
+    "realm": [
+      {
+        "name": "saga-viewer",
+        "description": "Read actuator endpoints, participant state and the order list"
+      },
+      {
+        "name": "saga-operator",
+        "description": "Viewer plus operational actions: DLT replay, saga retry/resolve, console message injection",
+        "composite": true,
+        "composites": { "realm": ["saga-viewer"] }
+      },
+      {
+        "name": "saga-admin",
+        "description": "Operator plus data changes: set customer credit and product stock",
+        "composite": true,
+        "composites": { "realm": ["saga-operator"] }
+      },
+      {
+        "name": "saga-metrics",
+        "description": "Scrape /actuator/prometheus only"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "saga-console",
+      "name": "Saga console",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "saga-console-dev-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:8080/*"],
+      "webOrigins": ["+"],
+      "attributes": { "post.logout.redirect.uris": "http://localhost:8080/*" },
+      "protocolMappers": [
+        {
+          "name": "realm roles as roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "multivalued": "true", "claim.name": "roles", "jsonType.label": "String",
+            "access.token.claim": "true", "id.token.claim": "true", "userinfo.token.claim": "true", "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience saga-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.custom.audience": "saga-api", "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true" }
+        }
+      ]
+    },
+    {
+      "clientId": "saga-cli",
+      "name": "Saga CLI and tests (direct access grants - development only)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "realm roles as roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "multivalued": "true", "claim.name": "roles", "jsonType.label": "String",
+            "access.token.claim": "true", "id.token.claim": "true", "userinfo.token.claim": "true", "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience saga-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.custom.audience": "saga-api", "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true" }
+        }
+      ]
+    },
+    {
+      "clientId": "saga-prometheus",
+      "name": "Prometheus scraper (client credentials)",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "saga-prometheus-dev-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "realm roles as roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "multivalued": "true", "claim.name": "roles", "jsonType.label": "String",
+            "access.token.claim": "true", "id.token.claim": "true", "userinfo.token.claim": "true", "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience saga-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.custom.audience": "saga-api", "access.token.claim": "true", "id.token.claim": "false", "introspection.token.claim": "true" }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "viewer",
+      "enabled": true,
+      "firstName": "Vera",
+      "lastName": "Viewer",
+      "email": "viewer@saga.local",
+      "emailVerified": true,
+      "credentials": [{ "type": "password", "value": "viewer", "temporary": false }],
+      "realmRoles": ["saga-viewer"]
+    },
+    {
+      "username": "operator",
+      "enabled": true,
+      "firstName": "Otto",
+      "lastName": "Operator",
+      "email": "operator@saga.local",
+      "emailVerified": true,
+      "credentials": [{ "type": "password", "value": "operator", "temporary": false }],
+      "realmRoles": ["saga-operator"]
+    },
+    {
+      "username": "admin",
+      "enabled": true,
+      "firstName": "Ada",
+      "lastName": "Admin",
+      "email": "admin@saga.local",
+      "emailVerified": true,
+      "credentials": [{ "type": "password", "value": "admin", "temporary": false }],
+      "realmRoles": ["saga-admin"]
+    },
+    {
+      "username": "service-account-saga-prometheus",
+      "enabled": true,
+      "serviceAccountClientId": "saga-prometheus",
+      "realmRoles": ["saga-metrics"]
+    }
+  ]
+}

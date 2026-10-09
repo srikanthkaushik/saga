@@ -5,12 +5,13 @@ Everything here is for **Windows Command Prompt (CMD)**. All commands run from t
 - [1. Prerequisites](#1-prerequisites)
 - [2. Build](#2-build)
 - [3. Start everything](#3-start-everything)
-- [4. Your first order](#4-your-first-order)
-- [5. Configuration overrides](#5-configuration-overrides)
-- [6. Stop and reset](#6-stop-and-reset)
-- [7. Run the tests](#7-run-the-tests)
-- [8. Look inside: databases and Kafka](#8-look-inside-databases-and-kafka)
-- [9. Troubleshooting](#9-troubleshooting)
+- [4. Sign in: users, roles and tokens](#4-sign-in-users-roles-and-tokens)
+- [5. Your first order](#5-your-first-order)
+- [6. Configuration overrides](#6-configuration-overrides)
+- [7. Stop and reset](#7-stop-and-reset)
+- [8. Run the tests](#8-run-the-tests)
+- [9. Look inside: databases and Kafka](#9-look-inside-databases-and-kafka)
+- [10. Troubleshooting](#10-troubleshooting)
 
 ## 1. Prerequisites
 
@@ -22,7 +23,7 @@ Everything here is for **Windows Command Prompt (CMD)**. All commands run from t
 | curl | ships with Windows 10+ | `curl --version` |
 | A browser | – | for the console at http://localhost:8080 |
 
-Ports that must be free: **5432** (Postgres), **9092** (Kafka), **8080–8083** (console and services), **8086** (AKHQ Kafka UI). Check one with `netstat -ano | findstr :8081`.
+Ports that must be free: **5432** (Postgres), **9092** (Kafka), **8080–8083** (console and services), **8086** (AKHQ Kafka UI), **8180** (Keycloak). Check one with `netstat -ano | findstr :8081`.
 
 ## 2. Build
 
@@ -30,7 +31,7 @@ Ports that must be free: **5432** (Postgres), **9092** (Kafka), **8080–8083** 
 mvn clean install -DskipITs
 ```
 
-This builds all six modules in about 10 s, skipping the end-to-end suite (which needs Docker and takes about 2 minutes, see [section 7](#7-run-the-tests)). The runnable jars land in:
+This builds all six modules in about 10 s, skipping the end-to-end suite (which needs Docker and takes a few minutes, see [section 8](#8-run-the-tests)). The runnable jars land in:
 
 ```
 order-service\target\order-service-0.0.1-SNAPSHOT.jar
@@ -48,13 +49,14 @@ saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
 docker compose up -d
 docker compose ps
 ```
-This starts three containers:
+This starts four containers:
 
 | Container | What | Reach it at |
 |---|---|---|
 | `saga-postgres` | Postgres 17, user `saga` / password `saga` | `localhost:5432` |
 | `saga-kafka` | Kafka 4.0, KRaft mode, a single broker | `localhost:9092` from the host; `kafka:29092` from other containers |
 | `saga-akhq` | [AKHQ](https://akhq.io) 0.28.0, a web UI for Kafka | http://localhost:8086 |
+| `saga-keycloak` | [Keycloak](https://www.keycloak.org) 26.7, the identity provider: sign-in, roles, tokens | http://localhost:8180 (admin console: `admin` / `admin`) |
 
 On first start, `docker\postgres\init.sql` creates the three databases `order_db`, `payment_db` and `inventory_db`. Data survives container re-creation, `docker compose down` and restarts. It lives in two named volumes:
 
@@ -65,13 +67,15 @@ On first start, `docker\postgres\init.sql` creates the three databases `order_db
 
 Only `docker compose down -v` deletes them.
 
-Kafka's storage is formatted on first start with the `CLUSTER_ID` set in `docker-compose.yml`. **Don't change that id while the volume exists:** Kafka refuses to start on storage formatted for a different cluster. If you need a new id, wipe first ([section 6](#6-stop-and-reset)).
+Kafka's storage is formatted on first start with the `CLUSTER_ID` set in `docker-compose.yml`. **Don't change that id while the volume exists:** Kafka refuses to start on storage formatted for a different cluster. If you need a new id, wipe first ([section 7](#7-stop-and-reset)).
 
 Kafka has two client listeners because "localhost" means something different in each place:
 - `localhost:9092` for the services on your machine;
 - `kafka:29092` on the compose network, for AKHQ.
 
 A container told to use `localhost:9092` would try to connect to itself.
+
+Keycloak runs in development mode and keeps no state of its own: on every start it imports the `saga` realm from `docker\keycloak\saga-realm.json` (roles, clients, dev users). Keycloak takes about 20 s to start. **Start it before the console**, which looks up Keycloak when it starts. The services only need it when the first token arrives.
 
 ### 3.2 Services
 Each command opens its own window, so you can watch the logs:
@@ -102,7 +106,7 @@ Each should answer `{"groups":["liveness","readiness"],"status":"UP"}`.
 start "console" java -jar saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
 start http://localhost:8080
 ```
-The three dots at the top of the console show service health (green = up).
+The browser is sent to Keycloak to sign in ([section 4](#4-sign-in-users-roles-and-tokens)). Afterwards the header shows who you are and a **Sign out** link, and the three dots show service health (green = up).
 
 ### 3.4 Seed data
 The Flyway migrations create these:
@@ -114,13 +118,41 @@ The Flyway migrations create these:
 | `product-1` | 100 in stock | general use |
 | `product-2` | 0 in stock | always fails inventory, so it triggers a refund |
 
-You can create or overwrite any customer or product at any time:
+With an admin token ([section 4](#4-sign-in-users-roles-and-tokens)) you can create or overwrite any customer or product at any time:
 ```
-curl -X PUT http://localhost:8082/customers/alice -H "Content-Type: application/json" -d "{\"availableCredit\":500}"
-curl -X PUT http://localhost:8083/products/widget -H "Content-Type: application/json" -d "{\"availableQuantity\":10}"
+call ops\token.cmd admin admin
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8082/customers/alice -H "Content-Type: application/json" -d "{\"availableCredit\":500}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8083/products/widget -H "Content-Type: application/json" -d "{\"availableQuantity\":10}"
 ```
 
-## 4. Your first order
+## 4. Sign in: users, roles and tokens
+
+Placing and reading an order (`POST /orders`, `GET /orders/{id}`) and health checks are public. **Everything else needs a Keycloak token**: actuator endpoints (DLT, stuck sagas, outbox, metrics), the read APIs for customers, products, payments and reservations, the order list, and the seed `PUT`s. The console needs a login.
+
+**Development users** (password = username):
+
+| User | Roles | Can |
+|---|---|---|
+| `viewer` | saga-viewer | read actuator endpoints, participant state, the order list |
+| `operator` | saga-operator (+ viewer) | also replay DLTs, retry/resolve stuck sagas, inject messages in the console |
+| `admin` | saga-admin (+ operator, viewer) | also set customer credit and product stock (the console's scenarios need this) |
+
+There is also a client `saga-prometheus` (client-credentials grant) with only `saga-metrics`, for scraping `/actuator/prometheus`. The roles are composite in Keycloak, so a token lists every role its user effectively has.
+
+**In the console:** sign in with one of the users above. Buttons your roles can't use are disabled, with the reason shown. Interventions are recorded under your user name.
+
+**With curl:** get a token into `%TOKEN%` with the helper, then send it as a bearer token:
+```
+call ops\token.cmd operator operator
+curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/stucksagas
+```
+- **Expiry:** tokens last **5 minutes**. When you get a 401, run `call ops\token.cmd …` again.
+- **401 vs 403:** 401 means no token, an invalid token or an expired one. 403 means a valid token whose user lacks the role.
+- **How the helper works:** it uses the `saga-cli` client with the password grant. That's convenient for local development only, which is why the client exists only in the dev realm.
+
+Which role each endpoint needs is listed in [PROJECT.md](../PROJECT.md#rest-apis).
+
+## 5. Your first order
 
 ```
 curl -i -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"customer-1\",\"productId\":\"product-1\",\"quantity\":2,\"amount\":100.00}"
@@ -133,7 +165,7 @@ shows `"status":"APPROVED"` and `"sagaState":"COMPLETED"`.
 
 Now go to [Scenarios](SCENARIOS.md) and work through them in order.
 
-## 5. Configuration overrides
+## 6. Configuration overrides
 
 Any property can be overridden on the command line with `--name=value` after the jar name. The defaults are listed in [PROJECT.md › Configuration](../PROJECT.md#configuration-applicationyml-defaults-shown). The most useful ones for exploring:
 
@@ -151,7 +183,7 @@ start "order" java -jar order-service\target\order-service-0.0.1-SNAPSHOT.jar --
 
 The backoff for every service is set with `--saga.kafka.retry.max-retries=4 --saga.kafka.retry.initial-interval=500ms`. The console's service URLs are set with `--saga.ui.services.order=http://localhost:8081` (and likewise for `payment` and `inventory`).
 
-## 6. Stop and reset
+## 7. Stop and reset
 
 | Goal | Do |
 |---|---|
@@ -161,7 +193,7 @@ The backoff for every service is set with `--saga.kafka.retry.max-retries=4 --sa
 
 Wipe Postgres and Kafka **together**. If you clear only one, the other still refers to sagas that no longer exist. For example, replies left in Kafka for sagas missing from `order_db` would be dead-lettered as "Unknown saga".
 
-## 7. Run the tests
+## 8. Run the tests
 
 ### End-to-end suite
 ```
@@ -188,7 +220,7 @@ docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prome
 ```
 This should print `SUCCESS`.
 
-## 8. Look inside: databases and Kafka
+## 9. Look inside: databases and Kafka
 
 ### Postgres
 Open a SQL shell on one service's database:
@@ -233,7 +265,7 @@ docker exec saga-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-serv
 ### HTTP
 Every endpoint is listed, with examples, in the console's **API console** tab. They're also tabulated in [PROJECT.md](../PROJECT.md#rest-apis).
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -252,4 +284,9 @@ Every endpoint is listed, with examples, in the console's **API console** tab. T
 | Kafka won't start and logs `Invalid cluster.id` | `CLUSTER_ID` in `docker-compose.yml` no longer matches the formatted storage. Restore the old id, or wipe with `docker compose down -v` |
 | `DUPLICATE_BROKER_REGISTRATION` INFO lines right after Kafka restarts | The controller still holds the previous incarnation's session for a few seconds. Harmless; it registers on its own |
 | A JWT "SECURITY WARNING" banner in `docker logs saga-akhq` | AKHQ's notice that it runs without authentication. Expected locally |
+| `401` from a service | No token, an expired one (they last 5 minutes), or one from another issuer. Run `call ops\token.cmd <user> <password>` again, and use `http://localhost:8180` for Keycloak (not `127.0.0.1`), because the URL becomes the token's issuer |
+| `403` from a service | The token is valid, but its user lacks the role (e.g. a viewer replaying a DLT, an operator setting stock). See the role table in [§4](#4-sign-in-users-roles-and-tokens) |
+| The console fails to start with `Unable to resolve Configuration with the provided Issuer` | Keycloak isn't up yet. `docker compose up -d`, wait about 20 s until http://localhost:8180/realms/saga/.well-known/openid-configuration answers, then start the console |
+| Keycloak says `Invalid parameter: redirect_uri` | The console isn't at http://localhost:8080 (the only redirect URI the dev realm allows). Use port 8080, or add your URL to the `saga-console` client |
+| `call ops\token.cmd` prints `Keycloak refused: invalid_grant` | Wrong user or password. Dev users are `viewer`, `operator` and `admin`, with password = username |
 | In Git Bash, `docker exec … /opt/kafka/bin/…` fails with a `C:/Program Files/Git/opt/...` path | Git Bash rewrites the path. Use CMD, or prefix the command with `MSYS_NO_PATHCONV=1` |

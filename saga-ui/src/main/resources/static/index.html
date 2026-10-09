@@ -19,6 +19,7 @@
         <button role="tab" data-tab="data" aria-selected="false">Customers &amp; products</button>
         <button role="tab" data-tab="console" aria-selected="false">API console</button>
     </nav>
+    <div class="who" id="who" aria-label="Signed-in user"></div>
 </header>
 
 <main>
@@ -28,6 +29,7 @@
             <section class="block">
                 <h2>Run a scenario</h2>
                 <p class="hint">Each scenario creates a fresh customer and product, then places the order.</p>
+                <p class="role-note" id="scenario-roles" hidden></p>
                 <div class="scenarios" id="scenarios"></div>
                 <p class="note" id="scenario-note" aria-live="polite"></p>
             </section>
@@ -89,9 +91,9 @@
                         <dl class="facts" id="saga-facts"></dl>
                         <div id="intervene" hidden>
                             <h4>Intervene</h4>
-                            <p class="hint">Retry re-sends the compensation now. Resolve closes the saga as failed: only do that after compensating by hand in the participant's database.</p>
+                            <p class="hint">Retry re-sends the compensation now. Resolve closes the saga as failed: only do that after compensating by hand in the participant's database. Recorded under your sign-in name.</p>
+                            <p class="role-note" id="intervene-roles" hidden></p>
                             <form id="intervene-form" class="form">
-                                <label>Operator <input name="operator" required placeholder="your name"></label>
                                 <label>Note <input name="note" placeholder="required for resolve"></label>
                                 <div class="row2">
                                     <button type="submit" name="action" value="retry">Retry compensation</button>
@@ -136,6 +138,7 @@
             <section class="block">
                 <h2>Inject a message</h2>
                 <p class="hint">Publishes straight onto a saga topic, skipping the outbox. Use the presets to see dead-lettering and replay.</p>
+                <p class="role-note" id="inject-roles" hidden></p>
                 <div class="presets" id="presets"></div>
                 <form id="inject-form" class="form">
                     <div class="row2">
@@ -181,6 +184,7 @@
 
     <!-- Data ---------------------------------------------------------------------------------------->
     <section class="tab" id="tab-data" hidden>
+        <p class="role-note" id="data-roles" hidden></p>
         <div class="two">
             <section class="block">
                 <h2>Customers</h2>

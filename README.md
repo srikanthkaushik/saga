@@ -10,6 +10,7 @@ This project is a working, tested implementation of that pattern, including the 
 - **Timeouts:** a participant that never answers doesn't hang an order.
 - **Fencing:** late messages can't charge or reserve for an order that was already cancelled.
 - **Alerting and manual resolution** for compensations that keep failing.
+- **OAuth2/JWT security with Keycloak**: roles for viewers, operators and admins, and audit records of who did what.
 - **A browser console** that shows each saga live and can call every endpoint.
 
 Java 21 · Spring Boot 4.0.6 · PostgreSQL 17 · Kafka 4.0 · Maven multi-module · Windows CMD
@@ -54,6 +55,8 @@ start "console"   java -jar saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
 start http://localhost:8080
 ```
 
+The console asks you to sign in through Keycloak. Use `admin` / `admin` to run everything; `operator` and `viewer` have fewer rights. Admin endpoints need a token: `call ops\token.cmd admin admin`, then `curl -H "Authorization: Bearer %TOKEN%" …`. See [Getting started §4](docs/GETTING-STARTED.md#4-sign-in-users-roles-and-tokens).
+
 In the console, click **Happy path**, then **Out of stock**, and compare the two routes on the state map. To see the raw Kafka messages behind them, open **AKHQ** at http://localhost:8086; `docker compose up -d` starts it along with Postgres and Kafka.
 
 ## Documentation
@@ -79,7 +82,7 @@ inventory-service/  reserves and releases stock
 saga-ui/            browser console (proxy + Kafka message injector + single-page UI)
 saga-e2e/           Testcontainers end-to-end tests that run the real jars
 ops/                Prometheus alert rules (+ tests) and the operator runbook
-docker/, docker-compose.yml   local Postgres, Kafka and AKHQ (Kafka web UI on :8086)
+docker/, docker-compose.yml   local Postgres, Kafka, AKHQ (Kafka web UI on :8086) and Keycloak (:8180, realm in docker/keycloak/)
 ```
 
-> **Not production-ready yet:** actuator endpoints and the credit/stock seed endpoints are unauthenticated, and the console is a local dev tool. See "Next / open" in [PROJECT.md](PROJECT.md).
+> **Security:** admin and seed endpoints and the console are protected with OAuth2/JWT (Keycloak). The identity setup is **development-grade**: Keycloak dev mode, dev users and secrets. See "Next / open" in [PROJECT.md](PROJECT.md).

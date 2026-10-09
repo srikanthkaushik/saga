@@ -93,6 +93,12 @@ code, .code, pre { font-family: var(--mono); font-size: .85em; }
 .health li.down::before { background: var(--fail); }
 
 .tabs { display: flex; gap: .25rem; margin-left: auto; flex-wrap: wrap; }
+
+.who { display: flex; gap: .75rem; align-items: center; font-size: .85rem; color: var(--muted); }
+.who a { color: var(--fwd); }
+
+.role-note { font-size: .82rem; color: var(--comp); background: var(--comp-soft); border-radius: var(--r-sm); padding: .4rem .6rem; margin: 0 0 .75rem; max-width: 70ch; }
+#tab-data > .role-note { margin-bottom: 1rem; }
 .tabs button {
     border: 0; background: none; color: var(--muted);
     padding: .4rem .75rem; border-radius: var(--r-sm);

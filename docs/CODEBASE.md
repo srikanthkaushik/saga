@@ -27,11 +27,11 @@ flowchart LR
 
 | Module | Packaging | Depends on | Key dependencies |
 |---|---|---|---|
-| `saga-common` | plain jar | – | data-jpa, kafka, json, spring-boot-actuator |
+| `saga-common` | plain jar | – | data-jpa, kafka, json, spring-boot-actuator, oauth2-resource-server |
 | `order-service` | Boot jar | saga-common | webmvc, validation, actuator, flyway, postgresql, micrometer-registry-prometheus |
 | `payment-service` | Boot jar | saga-common | webmvc, validation, actuator, flyway, postgresql |
 | `inventory-service` | Boot jar | saga-common | same as payment |
-| `saga-ui` | Boot jar | – | webmvc, kafka, actuator (no database) |
+| `saga-ui` | Boot jar | – | webmvc, kafka, actuator, security, oauth2-client (no database) |
 | `saga-e2e` | test only | the four jars (for build order) | testcontainers-postgresql/-kafka, kafka-clients, jackson, awaitility |
 
 All six modules inherit from the root [`pom.xml`](../pom.xml) (`saga-parent`, itself a child of `spring-boot-starter-parent` 4.0.6, Java 21). Versions come from Boot's dependency management; no module pins its own.
@@ -51,6 +51,7 @@ com.saga
 │   ├── messaging               message records, codec, topics, NonRetryableMessageException
 │   ├── outbox                  OutboxMessage, OutboxWriter, OutboxRelay, OutboxEndpoint
 │   ├── idempotency             ProcessedMessage, IdempotencyGuard
+│   ├── security                SagaSecurityConfig (the access rulebook for all three services)
 │   ├── kafka                   KafkaErrorHandlingConfig (retry/DLT), RetryProperties
 │   │   └── dlt                 DltEndpoint, DltReplayer
 │   └── SagaCommonConfig        @EnableScheduling + topic creation
@@ -67,7 +68,8 @@ com.saga
 │   ├── InventoryCommandHandler
 │   ├── api                     ProductController, ReservationController
 │   └── domain                  Product, Reservation
-└── ui                          (saga-ui) SagaUiApplication, ProxyController, InjectController
+└── ui                          (saga-ui) SagaUiApplication, ProxyController, InjectController,
+                                UiSecurityConfig, MeController
 ```
 
 ---
@@ -139,6 +141,7 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 | `kafka/RetryProperties` | `saga.kafka.retry.*` |
 | `kafka/dlt/DltEndpoint`, `DltReplayer` | Actuator `dlt`: pending counts and replay, scoped to this service's listeners |
 | `SagaCommonConfig` | `@EnableScheduling`; declares the 3 topics + 3 DLTs (3 partitions, DLT retention 14 days) |
+| `security/SagaSecurityConfig` | OAuth2 resource-server `SecurityFilterChain`: who may call which method + path (public / viewer / operator / admin / metrics), stateless, deny by default |
 
 ### order-service
 | Class | Responsibility |
@@ -167,7 +170,9 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 ### saga-ui
 | File | Responsibility |
 |---|---|
-| `ProxyController` | `/api/{order\|payment\|inventory}/**` pass-through via `RestClient.exchange`, returning 502 JSON when a service is unreachable |
+| `ProxyController` | `/api/{order\|payment\|inventory}/**` pass-through via `RestClient.exchange`, adding the signed-in user's access token (from `OAuth2AuthorizedClientManager`, which refreshes it); 502 JSON when a service is unreachable |
+| `UiSecurityConfig` | OIDC login (`oauth2Login`), Keycloak logout, `csrf.spa()`, 401-with-marker-header for `/api/**`, `saga-operator` for `/api/inject`, maps the ID token's `roles` claim to `ROLE_*` |
+| `MeController` | `GET /api/me`: username, name and saga roles of the signed-in user (read from the authentication, where the mapped roles live) |
 | `InjectController` | `POST /api/inject`: raw records to the 3 saga topics in the services' wire format |
 | `UiProperties` | `saga.ui.services.*` base URLs |
 | `static/index.html`, `styles.css`, `app.js` | The page. Vanilla JS, no build step. `derivePath` reconstructs the route from the timeline; `renderMap` draws the transit-map SVG; `refreshDetail` merges the three outboxes into the timeline |
@@ -192,6 +197,8 @@ Everything is tested end-to-end in **`saga-e2e`**. There are no per-service unit
 | [`SagaEndToEndIT`](../saga-e2e/src/test/java/com/saga/e2e/SagaEndToEndIT.java) | 23 tests (mapped to scenarios in [SCENARIOS.md › Scenario 14](SCENARIOS.md#scenario-14--the-automated-suite)) |
 | [`ServiceProcess`](../saga-e2e/src/test/java/com/saga/e2e/ServiceProcess.java) | Starts a jar as a child JVM on a free port with `--property=value` overrides, waits for `/actuator/health`, logs to `target/e2e-logs/<name>.log` |
 | [`KafkaProbe`](../saga-e2e/src/test/java/com/saga/e2e/KafkaProbe.java) | Sends raw records (any headers, any partition) and waits for a given `messageId` on a DLT |
+| [`KeycloakSupport`](../saga-e2e/src/test/java/com/saga/e2e/KeycloakSupport.java) | Keycloak Testcontainer with the same realm file as docker-compose; tokens per dev user (cached a minute), client-credentials and wrong-realm tokens; points the console client's redirect URI at the console's random port |
+| [`ConsoleSession`](../saga-e2e/src/test/java/com/saga/e2e/ConsoleSession.java) | A scripted browser: follows the OIDC redirect, submits Keycloak's login form, keeps cookies (treating `Secure` cookies like a browser on localhost) and sends requests with or without the CSRF header |
 
 How the suite works:
 - `@Testcontainers` starts Postgres 17 (with `docker/postgres/init.sql`) and `apache/kafka:4.0.0`.
@@ -202,7 +209,7 @@ How the suite works:
   - Postgres triggers that make refunds fail or block their reply (for stuck and intervention tests).
 - **Ordering:** those tests run last via `@Order(AFTER_EVERYTHING_ELSE)`, so the replay tests don't replay their poison records.
 
-Run it with `mvn clean verify`. The promtool tests for the alert rules are separate ([Getting started §7](GETTING-STARTED.md#7-run-the-tests)).
+Run it with `mvn clean verify`. The promtool tests for the alert rules are separate ([Getting started §8](GETTING-STARTED.md#8-run-the-tests)).
 
 ---
 
@@ -220,6 +227,14 @@ Run it with `mvn clean verify`. The promtool tests for the alert rules are separ
    - an idempotent compensation that writes a tombstone when there's nothing to undo;
    - Flyway `V1__init.sql` including `outbox` and `processed_message`.
 6. **Tests:** add the e2e cases. If you want the console to show it, add a station and tracks to `STATIONS`/`TRACKS` in `app.js`.
+
+### Protect a new endpoint
+Add its method and path to the rulebook in [`SagaSecurityConfig`](../saga-common/src/main/java/com/saga/common/security/SagaSecurityConfig.java), at the right role, before `anyRequest().denyAll()`. Until you do, it is denied (403), which is the safe default. If it needs a new role:
+- add the role to `docker/keycloak/saga-realm.json`, including the composite it belongs to;
+- grant it to the right dev users;
+- add a row to the e2e role matrix (`services_enforceRolesPerEndpoint`).
+
+If the console exposes it, gate the button in `applyRoleGates` in `app.js`.
 
 ### Add a configuration property
 Follow the `@ConfigurationProperties` record pattern with `@DefaultValue` (see `SagaTimeoutProperties`), and register it in the main class's `@EnableConfigurationProperties`. Add it to `application.yml` and to the configuration table in PROJECT.md.
@@ -245,6 +260,12 @@ Then add its id to `management.endpoints.web.exposure.include`, and add it to th
 - **Permanent failures** throw `NonRetryableMessageException`. Anything else is treated as transient and retried.
 - **Compensations must be idempotent and always reply**, even when there's nothing to undo; leave a tombstone in that case.
 - **Key every message by orderId.**
+
+**Security rules**
+- **Every endpoint gets a rule** in `SagaSecurityConfig`; anything unlisted is denied.
+- **Never trust identity from a request body.** Use the authenticated principal (`preferred_username`).
+- **Keep the Keycloak URL identical everywhere** (`http://localhost:8180`), because it becomes the token issuer.
+- **Console calls:** state-changing calls from the page must send `X-XSRF-TOKEN`; `call()` in `app.js` does it.
 
 **Boot 4 specifics that will bite** (full list in [PROJECT.md](../PROJECT.md#boot-4-gotchas-verified))
 - Starters are renamed: `spring-boot-starter-webmvc`, `spring-boot-starter-kafka`, `spring-boot-starter-flyway` (+ `flyway-database-postgresql`).

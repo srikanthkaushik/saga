@@ -17,7 +17,12 @@ const state = {
     mapKey: null,
     busy: new Set(),
     ticks: 0,
+    user: { username: '', roles: [] },
 };
+
+/* Keycloak roles are composite (admin ⊃ operator ⊃ viewer); the token lists every role the user effectively has. */
+const ROLE = { viewer: 'saga-viewer', operator: 'saga-operator', admin: 'saga-admin' };
+const can = (role) => state.user.roles.includes(role);
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -46,9 +51,15 @@ function svg(tag, attrs = {}, text) {
     return node;
 }
 
+function csrfToken() {
+    const match = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+    return match ? decodeURIComponent(match[1]) : '';
+}
+
 async function call(service, method, path, body) {
     const url = service === 'ui' ? path : `/api/${service}${path}`;
     const init = { method, headers: { Accept: 'application/json, text/plain, */*' } };
+    if (method !== 'GET' && method !== 'HEAD') init.headers['X-XSRF-TOKEN'] = csrfToken();
     if (body !== undefined && body !== null && body !== '') {
         init.headers['Content-Type'] = 'application/json';
         init.body = typeof body === 'string' ? body : JSON.stringify(body);
@@ -59,6 +70,11 @@ async function call(service, method, path, body) {
         response = await fetch(url, init);
     } catch (e) {
         return { ok: false, status: 0, data: { error: 'The saga console backend is not reachable. Is saga-ui running?' }, text: String(e), ms: 0 };
+    }
+    if (response.status === 401 && response.headers.get('X-Saga-Console-Login')) {
+        // The console session has expired: reload, which sends the browser through the Keycloak login again
+        location.reload();
+        return { ok: false, status: 401, data: { error: 'Your session has expired. Signing you in again…' }, text: '', ms: 0 };
     }
     const text = await response.text();
     let data = text;
@@ -75,6 +91,8 @@ function errorText(result) {
         if (d.detail) return d.detail;
         if (d.message) return d.message;
     }
+    if (result.status === 401) return 'The service rejected the access token (401). Try signing out and in again.';
+    if (result.status === 403) return `Not allowed for ${state.user.username || 'your account'} (403): this action needs a higher role.`;
     if (result.status === 400) return 'The request was rejected as invalid (400). Check the values.';
     if (result.status === 404) return 'Not found (404).';
     return `Request failed with HTTP ${result.status}.`;
@@ -118,8 +136,44 @@ function facts(dl, pairs) {
     dl.replaceChildren(...pairs.flatMap(([term, value]) => [h('dt', { text: term }), h('dd', {}, value ?? '–')]));
 }
 
-function store(key, value) { try { localStorage.setItem(key, value); } catch { /* storage unavailable */ } }
-function recall(key) { try { return localStorage.getItem(key) || ''; } catch { return ''; } }
+/* ------------------------------------------------------------------ signed-in user and role gates */
+
+const needs = (role) => `Needs the ${role} role; ${state.user.username || 'you'} has ${state.user.roles.join(', ') || 'no saga roles'}.`;
+
+async function loadMe() {
+    const result = await get('ui', '/api/me');
+    if (result.ok) state.user = result.data;
+    const roles = state.user.roles.map((r) => r.replace('saga-', '')).join(', ') || 'no saga roles';
+    $('#who').replaceChildren(
+        h('span', { text: `${state.user.name || state.user.username} (${roles})`, title: `Signed in as ${state.user.username}` }),
+        h('a', { href: '/logout', text: 'Sign out' }));
+}
+
+/** Disables what the signed-in user's roles can't do, with the reason, instead of letting them hit a 403. */
+function applyRoleGates() {
+    const gate = (elements, role) => {
+        if (can(role)) return;
+        for (const el of elements) {
+            el.disabled = true;
+            el.title = needs(role);
+        }
+    };
+    gate(document.querySelectorAll('.scenario'), ROLE.admin);
+    gate(document.querySelectorAll('#customer-form button, #product-form button'), ROLE.admin);
+    gate(document.querySelectorAll('#intervene-form button'), ROLE.operator);
+    gate(document.querySelectorAll('#inject-form button, #presets button'), ROLE.operator);
+    const notes = [
+        ['#scenario-roles', ROLE.admin, 'Scenarios create customers and products, which needs the saga-admin role. You can still place orders for existing customers below.'],
+        ['#intervene-roles', ROLE.operator, 'Retry and resolve need the saga-operator role.'],
+        ['#inject-roles', ROLE.operator, 'Publishing messages needs the saga-operator role.'],
+        ['#data-roles', ROLE.admin, 'Changing credit or stock needs the saga-admin role.'],
+    ];
+    for (const [selector, role, text] of notes) {
+        const el = $(selector);
+        el.hidden = can(role);
+        el.textContent = can(role) ? '' : text;
+    }
+}
 
 /* ------------------------------------------------------------------ tabs, health, polling */
 
@@ -229,7 +283,7 @@ async function runScenario(sc) {
         note.className = 'error';
         note.textContent = e.message;
     } finally {
-        buttons.forEach((b) => { b.disabled = false; });
+        buttons.forEach((b) => { b.disabled = !can(ROLE.admin); });
     }
 }
 
@@ -531,9 +585,9 @@ async function intervene(event) {
     const action = event.submitter ? event.submitter.value : 'retry';
     const error = $('#intervene-error');
     error.textContent = '';
-    store('operator', form.operator.value);
+    // The service records the signed-in user from the access token; the body field is ignored when authenticated
     const result = await call('order', 'POST', `/actuator/stucksagas/${state.sagaId}`, {
-        action, operator: form.operator.value, note: form.note.value || null,
+        action, operator: state.user.username, note: form.note.value || null,
     });
     if (!result.ok) {
         error.textContent = errorText(result);
@@ -611,14 +665,14 @@ function dltCard(service, entry) {
     const pending = h('div', { class: 'pending' });
     const result = h('p', { class: 'result', 'aria-live': 'polite' });
     const limit = h('input', { type: 'number', min: 1, max: 10000, value: 100, 'aria-label': 'Replay limit' });
-    const button = h('button', { type: 'submit', text: 'Replay', disabled: entry.topic === null });
+    const button = h('button', { type: 'submit', text: 'Replay', disabled: entry.topic === null || !can(ROLE.operator), title: can(ROLE.operator) ? null : needs(ROLE.operator) });
     const form = h('form', {
         onsubmit: async (event) => {
             event.preventDefault();
             button.disabled = true;
             result.textContent = 'Replaying…';
             const r = await call(service, 'POST', `/actuator/dlt/${entry.topic}`, { limit: Number(limit.value) });
-            button.disabled = false;
+            button.disabled = !can(ROLE.operator);
             result.textContent = r.ok ? `Replayed ${r.data.replayed}; ${r.data.pending} still pending.` : errorText(r);
             once('ops', refreshOps);
         },
@@ -739,8 +793,8 @@ const CATALOGUE = {
         ['GET', '/actuator/outbox/{orderId}', 'Commands sent for an order'],
         ['GET', '/actuator/stucksagas', 'Stuck sagas'],
         ['GET', '/actuator/stucksagas/{sagaId}', 'Saga detail and interventions'],
-        ['POST', '/actuator/stucksagas/{sagaId}', 'Retry a compensation', { action: 'retry', operator: 'me' }],
-        ['POST', '/actuator/stucksagas/{sagaId}', 'Resolve a compensation', { action: 'resolve', operator: 'me', note: 'Refunded in payment_db' }],
+        ['POST', '/actuator/stucksagas/{sagaId}', 'Retry a compensation (recorded as you)', { action: 'retry' }],
+        ['POST', '/actuator/stucksagas/{sagaId}', 'Resolve a compensation (recorded as you)', { action: 'resolve', note: 'Refunded in payment_db' }],
         ['GET', '/actuator/dlt', 'Dead-letter topics'],
         ['POST', '/actuator/dlt/order.saga.replies', 'Replay dead-lettered replies', { limit: 100 }],
         ['GET', '/actuator/metrics/saga.compensation.stuck', 'Stuck gauge'],
@@ -822,11 +876,11 @@ async function sendConsole(event) {
 
 /* ------------------------------------------------------------------ start */
 
-function init() {
+async function init() {
+    await loadMe();
     document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab)));
     $('#order-form').addEventListener('submit', placeOrder);
     $('#intervene-form').addEventListener('submit', intervene);
-    $('#intervene-form').operator.value = recall('operator');
     $('#inject-form').addEventListener('submit', inject);
     $('#customer-form').addEventListener('submit', saveData('payment', 'customers', 'availableCredit', '#customer-error'));
     $('#product-form').addEventListener('submit', saveData('inventory', 'products', 'availableQuantity', '#product-error'));
@@ -836,6 +890,7 @@ function init() {
     renderPresets();
     renderCatalogue();
     $('#presets').firstElementChild.click();
+    applyRoleGates();
 
     applyHash();
     window.addEventListener('hashchange', applyHash);

@@ -4,7 +4,7 @@
 
 Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQL 17, Kafka 4.0 (KRaft), multi-module Maven.
 
-**Checkpoint 2026-10-09:** feature-complete for the core saga plus its failure handling: outbox, idempotency, DLT with backoff and replay, timeouts with fencing, stuck-compensation alerting, and manual resolution. A local **saga console** (`saga-ui`, http://localhost:8080) demos and exercises all of it. 23 e2e tests green, promtool rule tests green. Not yet production-hardened; see [Next / open](#next--open), and above all the unauthenticated actuator and seed endpoints.
+**Checkpoint 2026-10-09:** feature-complete for the core saga plus its failure handling: outbox, idempotency, DLT with backoff and replay, timeouts with fencing, stuck-compensation alerting, and manual resolution. A local **saga console** (`saga-ui`, http://localhost:8080) demos and exercises all of it. 23 e2e tests green, promtool rule tests green. Admin endpoints, seed endpoints and the console are secured with **OAuth2/JWT (Keycloak)**, with roles viewer, operator, admin and metrics. Not yet production-hardened: Keycloak runs in dev mode and the secrets are dev defaults (see [Next / open](#next--open)).
 
 ## Modules
 | Module | Port | Role |
@@ -17,7 +17,7 @@ Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQ
 | `saga-e2e` | random | Testcontainers end-to-end tests that run the real service and console jars as child processes |
 
 Each service owns its database (`order_db`, `payment_db`, `inventory_db`) on one Postgres instance. Other files:
-- `docker-compose.yml`: Postgres, Kafka and **AKHQ** (Kafka web UI at http://localhost:8086) for local runs.
+- `docker-compose.yml`: Postgres, Kafka, **AKHQ** (Kafka web UI at http://localhost:8086) and **Keycloak** (http://localhost:8180, realm `saga` imported from `docker/keycloak/saga-realm.json`) for local runs.
   - Kafka advertises two client listeners: `localhost:9092` for host apps, and `kafka:29092` on the compose network (AKHQ).
   - Kafka data lives in the named volume `saga-kafka-data` (`KAFKA_LOG_DIRS=/var/lib/kafka/data`, a pinned `CLUSTER_ID`). Topics, messages and offsets survive re-creation; only `down -v` wipes them, together with Postgres.
 - `docker\postgres\init.sql` (creates the three DBs)
@@ -95,8 +95,16 @@ Replies that don't match the saga's current state (late, duplicate, out of order
   - `retry` re-sends now and resets the stuck count.
   - `resolve` closes the saga as FAILED and requires a note. **The manual compensation must be done in the participant's own records first**; then any queued or replayed compensation is a no-op there. See `ops\RUNBOOK.md`.
   - Every intervention is recorded in `saga_intervention` (action, operator, note, from-state, to-state, time) and logged at WARN.
-  - The operator is taken from the request body until actuator is secured; after that, from the authenticated principal (the endpoint already takes `SecurityContext`).
-- **Admin APIs are actuator endpoints**, not controllers, so they are off unless exposed and can move behind a management port or security. **Today they are unauthenticated.**
+  - The operator is the **authenticated user** (the token's `preferred_username`, via the actuator `SecurityContext`). Any `operator` in the body is ignored.
+- **Admin APIs are actuator endpoints**, not controllers, so they are off unless exposed.
+
+**Security** (details in [Architecture §9](docs/ARCHITECTURE.md#9-security))
+- **OAuth2/JWT via Keycloak.** The three services are resource servers sharing one rulebook, `SagaSecurityConfig` in saga-common: stateless, deny by default. They validate the signature (JWKS), the issuer `http://localhost:8180/realms/saga` and the audience `saga-api`. Roles are mapped from the `roles` claim by Boot properties (`authorities-claim-name`, `authority-prefix`, `principal-claim-name`); no custom converter.
+- **Roles** are composite realm roles: `saga-viewer` ⊂ `saga-operator` ⊂ `saga-admin`, plus `saga-metrics`. The `roles` claim and the `saga-api` audience come from protocol mappers on each client, not from a realm-level client scope (a custom `clientScopes` list in an import would replace the built-in `profile`/`basic` scopes).
+- **Public:** health, `POST /orders`, `GET /orders/{id}`. The customer-facing order API is out of scope for now.
+- **Console:** an OIDC client (`saga-console`, auth code), with tokens in the server-side session, token relay through the proxy (`OAuth2AuthorizedClientManager` refreshes them), `csrf.spa()`, and RP-initiated logout. The page reads roles from `/api/me` and disables what the user can't do; the services enforce it regardless.
+- **Other clients:** `saga-cli` (public, password grant, dev only; used by `ops\token.cmd` and e2e) and `saga-prometheus` (client credentials, role `saga-metrics`; see `ops/prometheus/prometheus.yml`).
+- **Dev users:** `viewer`, `operator`, `admin` (password = username). Dev secrets in the realm file and in `saga-ui`'s `application.yml` (`SAGA_CONSOLE_CLIENT_SECRET` overrides).
 
 ## Configuration (`application.yml`, defaults shown)
 | Property | Default | Where | Notes |
@@ -131,24 +139,30 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 ## REST APIs
 | Endpoint | Service | Purpose |
 |---|---|---|
-| `POST /orders`, `GET /orders/{id}` | order | place an order; order + saga state |
-| `GET /orders?limit=50` | order | recent orders, newest first (limit 1–200) |
-| `GET /customers`, `GET /customers/{id}`, `PUT /customers/{id}` `{"availableCredit"}` | payment | credit; **PUT is seed tooling** |
-| `GET /payments/{orderId}` | payment | COMPLETED / REFUNDED / CANCELLED tombstone |
-| `GET /products`, `GET /products/{id}`, `PUT /products/{id}` `{"availableQuantity"}` | inventory | stock; **PUT is seed tooling** |
-| `GET /reservations/{orderId}` | inventory | RESERVED / RELEASED |
+| `POST /orders`, `GET /orders/{id}` | order | place an order; order + saga state. **public** |
+| `GET /orders?limit=50` | order | recent orders, newest first (limit 1–200). viewer |
+| `GET /customers`, `GET /customers/{id}` | payment | credit. viewer |
+| `PUT /customers/{id}` `{"availableCredit"}` | payment | set credit (seed tooling). **admin** |
+| `GET /payments/{orderId}` | payment | COMPLETED / REFUNDED / CANCELLED tombstone. viewer |
+| `GET /products`, `GET /products/{id}` | inventory | stock. viewer |
+| `PUT /products/{id}` `{"availableQuantity"}` | inventory | set stock (seed tooling). **admin** |
+| `GET /reservations/{orderId}` | inventory | RESERVED / RELEASED. viewer |
+
+Roles: viewer < operator < admin (composite); `saga-metrics` only reaches `/actuator/prometheus`. No token → 401, wrong role → 403, unlisted endpoint → 403.
 
 ## Actuator endpoints
 | Endpoint | Service | Purpose |
 |---|---|---|
-| `GET /actuator/health`, `/info` | all | liveness/info |
-| `GET /actuator/outbox/{orderId}` | all | messages this service emitted for an order (payload as JSON, created/published times). Merged across services = the saga timeline |
-| `GET /actuator/dlt`, `GET /actuator/dlt/{topic}` | all | owned DLTs with pending counts |
-| `POST /actuator/dlt/{topic}` body `{"limit":n}` | all | replay pending records (default 100, max 10000) |
-| `GET /actuator/stucksagas` | order | stuck sagas, oldest first |
-| `GET /actuator/stucksagas/{sagaId}` | order | saga detail + intervention history (any saga) |
-| `POST /actuator/stucksagas/{sagaId}` body `{"action","operator","note"}` | order | `retry` / `resolve`. 400 bad request, 404 unknown saga, 409 not compensating or concurrent change |
-| `GET /actuator/metrics`, `/actuator/prometheus` | order | Micrometer / Prometheus scrape |
+| `GET /actuator/health` | all | liveness. **public** |
+| `GET /actuator/info` | all | info. viewer |
+| `GET /actuator/outbox/{orderId}` | all | messages this service emitted for an order (payload as JSON, created/published times). Merged across services = the saga timeline. viewer |
+| `GET /actuator/dlt`, `GET /actuator/dlt/{topic}` | all | owned DLTs with pending counts. viewer |
+| `POST /actuator/dlt/{topic}` body `{"limit":n}` | all | replay pending records (default 100, max 10000). **operator** |
+| `GET /actuator/stucksagas` | order | stuck sagas, oldest first. viewer |
+| `GET /actuator/stucksagas/{sagaId}` | order | saga detail + intervention history (any saga). viewer |
+| `POST /actuator/stucksagas/{sagaId}` body `{"action","note"}` | order | `retry` / `resolve`, recorded under the token's user. **operator**. 400 bad request, 404 unknown saga, 409 not compensating or concurrent change |
+| `GET /actuator/metrics` | order | Micrometer. viewer |
+| `GET /actuator/prometheus` | order | Prometheus scrape. metrics or viewer |
 
 Metrics:
 - `saga_compensation_stuck`
@@ -187,6 +201,13 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 - Proxying with `RestClient`: use `exchange(...)` to pass upstream 4xx/5xx through untouched (no status handlers run), and `JdkClientHttpRequestFactory` for connect and read timeouts.
 - Testcontainers 2.x: `testcontainers-postgresql`/`-kafka`/`-junit-jupiter`. Use `org.testcontainers.postgresql.PostgreSQLContainer` (non-generic) and `org.testcontainers.kafka.KafkaContainer`.
 - A fresh broker logs `NotCoordinatorException` for a few seconds while `__consumer_offsets` is created. Harmless.
+- **Security starters:** `spring-boot-starter-oauth2-resource-server` and `spring-boot-starter-oauth2-client` (unchanged names). Boot's JWT properties `audiences`, `authorities-claim-name`, `authority-prefix` and `principal-claim-name` replace a custom `JwtAuthenticationConverter`.
+- **Spring Security 7 `csrf.spa()`** sets up the `XSRF-TOKEN` cookie plus `X-XSRF-TOKEN` header pattern in one line.
+- **`oauth2Login` only redirects requests that accept `text/html`.** curl (`Accept: */*`) falls through to the other entry point, so the console answers it with a 401.
+- **With a `GrantedAuthoritiesMapper`, the mapped roles are on the `Authentication`**, not on the `OidcUser` principal. `@AuthenticationPrincipal OidcUser#getAuthorities()` returns the unmapped ones.
+- **The OAuth2 client resolves `issuer-uri` at startup,** so the console fails to start while Keycloak is down. Resource servers resolve it lazily, on the first token.
+- **Keycloak 26:** bootstrap admin is `KC_BOOTSTRAP_ADMIN_USERNAME/PASSWORD`; `start-dev --import-realm` skips realms that already exist; users need first name, last name and email, or the login asks for them (and the password grant fails).
+- **Keycloak login cookies are `Secure; SameSite=None`.** Browsers send them to `http://localhost`, but `java.net.CookieManager` does not. The e2e login client strips `Secure` (`ConsoleSession.LocalhostCookies`).
 
 ## Run (CMD)
 ```
@@ -198,6 +219,10 @@ start "inventory" java -jar inventory-service\target\inventory-service-0.0.1-SNA
 start "console"   java -jar saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
 start http://localhost:8080
 
+rem protected endpoints: get a token first (dev users viewer/operator/admin, password = username)
+call ops\token.cmd admin admin
+curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/stucksagas
+
 curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"customer-1\",\"productId\":\"product-1\",\"quantity\":2,\"amount\":100.00}"
 curl http://localhost:8081/orders/<id>
 ```
@@ -208,14 +233,15 @@ curl http://localhost:8081/orders/<id>
 - **Faster timeout demo:** start order-service with `--saga.timeout.payment=10s --saga.timeout.compensation=10s`.
 
 ## Tests
-- `mvn clean verify` builds everything and runs `SagaEndToEndIT`: 23 tests, about 110s. Docker is required; the suite is skipped automatically without it. Add `-DskipITs` to skip it.
+- `mvn clean verify` builds everything and runs `SagaEndToEndIT`: 27 tests, about 2 minutes. Docker is required; the suite is skipped automatically without it. Add `-DskipITs` to skip it.
 - Alert rules are tested separately:
   ```
   docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prometheus test rules /rules/saga-alerts.test.yml
   ```
 
 **Harness**
-- Testcontainers starts Postgres 17 (with `docker\postgres\init.sql`) and `apache/kafka:4.0.0`.
+- Testcontainers starts Postgres 17 (with `docker\postgres\init.sql`), `apache/kafka:4.0.0` and Keycloak 26.7 (with the same `docker\keycloak\saga-realm.json`).
+- Protected calls use an `admin` token by default, interventions an `operator` token. Placing and reading orders stays token-less, which proves those endpoints are public.
 - The packaged jars are launched as child JVMs on free ports, with test settings: 1s/2s/4s backoff, 3s step timeouts, a 250ms scan, and a stuck threshold of 2.
 - Service logs go to `saga-e2e\target\e2e-logs\`. `KafkaProbe` injects raw records and reads DLTs.
 - Each test seeds its own customer and product (UUID ids) over JDBC.
@@ -232,6 +258,7 @@ curl http://localhost:8081/orders/<id>
 | Intervention | retry resets the count and is audited; resolve after a manual refund → FAILED/REJECTED and the late queued refund is a no-op (no double refund); 400/404/409 cases |
 | Read / seed APIs | payment and reservation status, credit and stock reads; outboxes give exactly `ProcessPayment, ReserveInventory, RefundPayment` / `PaymentProcessed, PaymentRefunded` / `InventoryFailed` for a compensated order; orders list newest-first; PUT upsert, and 400 for negative values or a bad id |
 | Console (`saga-ui`) | serves the page; seed and order **through the proxy** → APPROVED; upstream 404 passes through; unknown service 404; Prometheus via proxy; `/api/inject` lands on the DLT; non-saga topic → 400 |
+| Security | role matrix (none/viewer/operator/admin × health, actuator read, order list, credit read, DLT replay, seed PUT, unlisted) = 401/403/200 as designed; wrong-realm and garbage tokens → 401 with `WWW-Authenticate: Bearer`; `saga-prometheus` scrapes but can't read DLTs; audit records the token's user even when the body says otherwise; console: redirect to Keycloak, 401 with a marker header for `/api`, scripted login, token relay, CSRF required, viewer can't replay or inject, operator can't seed |
 | Alert rules (promtool) | stuck fires once with two instances (`max`), ignores blips shorter than `for`; slow and missing alerts fire. Checked to fail if `max` is swapped for `sum` |
 
 ## Done
@@ -242,6 +269,7 @@ curl http://localhost:8081/orders/<id>
 - [x] Saga timeouts + ReleaseInventory compensation + tombstone fencing + listener concurrency 3
 - [x] Stuck-compensation alerting: metrics, Prometheus export, alert rules + promtool tests
 - [x] Manual resolution: retry/resolve with audit trail, saga detail view, operator runbook
+- [x] 2026-10-09: **Security**: Keycloak 26.7 + OAuth2/JWT resource servers + console OIDC login with token relay and CSRF + role-aware UI + `ops\token.cmd` + Prometheus client credentials. 27 e2e tests green, plus a headless-Chrome login check per role.
 - [x] 2026-10-09: Kafka named volume + pinned CLUSTER_ID. Verified that topics, message counts and committed offsets are identical after `--force-recreate`, and orders keep flowing.
 - [x] 2026-10-09: AKHQ 0.28.0 Kafka UI in docker-compose (port 8086) plus a `DOCKER` listener on Kafka for container clients. Verified against Kafka 4.0: topics, counts, lag, DLT records with headers, and groups (3 members each).
 - [x] 2026-10-09: saga console (`saga-ui`) + read/seed APIs + outbox endpoint.
@@ -249,11 +277,14 @@ curl http://localhost:8081/orders/<id>
   - That browser check is a one-off script and is **not** in the repo.
 
 ## Next / open
-- [ ] **Secure actuator and the seed endpoints** (separate `management.server.port` and/or Spring Security). Unauthenticated today:
-  - `dlt` replay, `stucksagas` retry/resolve and `outbox`;
-  - `PUT /customers/{id}` and `PUT /products/{id}`, which can rewrite balances and stock.
-  
-  Required before any shared environment. Then also decide whether `saga-ui` should exist outside local/dev at all (it binds 127.0.0.1 by default).
+- [ ] **Production identity setup:**
+  - Keycloak in production mode (`start`, a real database, HTTPS, its own hostname);
+  - secrets from a vault or the environment instead of the realm file;
+  - no dev users, no `saga-cli` password grant;
+  - shorter-lived console sessions.
+- [ ] Secure the customer-facing order API (`POST /orders`, `GET /orders/{id}`). Customers would need their own role or client, and to be limited to their own orders.
+- [ ] AKHQ is still unauthenticated (dev only); it supports OIDC if it ever leaves local development.
+- [ ] Decide whether `saga-ui` should exist outside local/dev at all (it binds 127.0.0.1 by default).
 - [ ] Browser tests for the console in CI (e.g. Playwright for Java), if it becomes more than a dev tool.
 - [ ] Per-service slice tests (orchestrator transitions on illegal or out-of-order replies, duplicate-delivery idempotency). Today everything is proven through e2e only.
 - [ ] Alert on DLT pending > 0 (expose `DltReplayer.status` as a gauge, add a rule and a runbook entry).

@@ -33,6 +33,7 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
@@ -81,6 +82,12 @@ class SagaEndToEndIT {
     @Container
     static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:4.0.0");
 
+    /** Same image and realm file as docker-compose; every party uses its URL, so token issuers match. */
+    static final KeycloakSupport KEYCLOAK = new KeycloakSupport(Path.of(System.getProperty("saga.e2e.realm-json")));
+
+    @Container
+    static final GenericContainer<?> KEYCLOAK_CONTAINER = KEYCLOAK.container();
+
     private static final HttpClient HTTP = HttpClient.newHttpClient();
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final List<ServiceProcess> SERVICES = new ArrayList<>();
@@ -100,8 +107,10 @@ class SagaEndToEndIT {
                 "spring.kafka.bootstrap-servers", KAFKA.getBootstrapServers(),
                 "saga.ui.services.order", orderService.baseUrl(),
                 "saga.ui.services.payment", paymentService.baseUrl(),
-                "saga.ui.services.inventory", inventoryService.baseUrl()));
+                "saga.ui.services.inventory", inventoryService.baseUrl(),
+                "spring.security.oauth2.client.provider.keycloak.issuer-uri", KEYCLOAK.issuer()));
         SERVICES.add(uiService);
+        KEYCLOAK.allowConsoleAt(uiService.baseUrl());
         for (ServiceProcess service : SERVICES) {
             service.awaitHealthy(HTTP);
         }
@@ -324,14 +333,14 @@ class SagaEndToEndIT {
     @Test
     void dltEndpoint_onlyServesTopicsTheServiceConsumes() throws Exception {
         HttpResponse<String> list = HTTP.send(
-                HttpRequest.newBuilder(URI.create(orderService.baseUrl() + "/actuator/dlt")).build(),
+                authed(URI.create(orderService.baseUrl() + "/actuator/dlt")).build(),
                 HttpResponse.BodyHandlers.ofString());
         assertThat(list.statusCode()).isEqualTo(200);
         JsonNode dlts = JSON.readTree(list.body());
         assertThat(dlts).hasSize(1);
         assertThat(dlts.get(0).get("dltTopic").asString()).isEqualTo("order.saga.replies-dlt");
 
-        HttpResponse<String> foreign = HTTP.send(HttpRequest.newBuilder(
+        HttpResponse<String> foreign = HTTP.send(authed(
                                 URI.create(orderService.baseUrl() + "/actuator/dlt/payment.commands"))
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString("{}"))
@@ -339,7 +348,7 @@ class SagaEndToEndIT {
                 HttpResponse.BodyHandlers.ofString());
         assertThat(foreign.statusCode()).isEqualTo(400);
 
-        HttpResponse<String> badLimit = HTTP.send(HttpRequest.newBuilder(
+        HttpResponse<String> badLimit = HTTP.send(authed(
                                 URI.create(orderService.baseUrl() + "/actuator/dlt/order.saga.replies"))
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString("{\"limit\":0}"))
@@ -535,39 +544,145 @@ class SagaEndToEndIT {
 
     @Test
     void sagaConsole_servesPage_proxiesServices_andInjectsMessages() throws Exception {
-        assertThat(get(uiService, "/")).contains("<title>Saga console</title>");
-        assertThat(get(uiService, "/app.js")).contains("derivePath");
+        ConsoleSession admin = ConsoleSession.login(uiService.baseUrl(), "admin", "admin");
+        assertThat(admin.get("/").body()).contains("<title>Saga console</title>");
+        assertThat(admin.get("/app.js").body()).contains("derivePath");
 
-        // Seed and order entirely through the console's proxy
+        // Seed and order entirely through the console's proxy (the admin's token is relayed)
         String id = "ui-" + UUID.randomUUID();
-        assertThat(put(uiService, "/api/payment/customers/" + id, "{\"availableCredit\":100}").statusCode()).isEqualTo(200);
-        assertThat(put(uiService, "/api/inventory/products/" + id, "{\"availableQuantity\":3}").statusCode()).isEqualTo(200);
-        HttpResponse<String> created = HTTP.send(HttpRequest.newBuilder(URI.create(uiService.baseUrl() + "/api/order/orders"))
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(
-                                "{\"customerId\":\"" + id + "\",\"productId\":\"" + id + "\",\"quantity\":1,\"amount\":10.00}"))
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+        assertThat(admin.send("PUT", "/api/payment/customers/" + id, "{\"availableCredit\":100}", true).statusCode()).isEqualTo(200);
+        assertThat(admin.send("PUT", "/api/inventory/products/" + id, "{\"availableQuantity\":3}", true).statusCode()).isEqualTo(200);
+        HttpResponse<String> created = admin.send("POST", "/api/order/orders",
+                "{\"customerId\":\"" + id + "\",\"productId\":\"" + id + "\",\"quantity\":1,\"amount\":10.00}", true);
         assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
         UUID orderId = UUID.fromString(JSON.readTree(created.body()).get("id").asString());
         assertThat(awaitTerminal(orderId).get("status").asString()).isEqualTo("APPROVED");
-        assertThat(JSON.readTree(get(uiService, "/api/order/orders/" + orderId + "?ignored=1")).get("status").asString())
+        assertThat(JSON.readTree(admin.get("/api/order/orders/" + orderId + "?ignored=1").body()).get("status").asString())
                 .isEqualTo("APPROVED");
 
         // Errors pass through untouched; unknown services are not proxied
-        assertThat(status(uiService, "/api/order/orders/" + UUID.randomUUID())).isEqualTo(404);
-        assertThat(status(uiService, "/api/somewhere/else")).isEqualTo(404);
-        assertThat(get(uiService, "/api/order/actuator/prometheus")).contains("saga_compensation_stuck");
+        assertThat(admin.get("/api/order/orders/" + UUID.randomUUID()).statusCode()).isEqualTo(404);
+        assertThat(admin.get("/api/somewhere/else").statusCode()).isEqualTo(404);
+        assertThat(admin.get("/api/order/actuator/prometheus").body()).contains("saga_compensation_stuck");
 
         // Injection publishes in the services' wire format
-        HttpResponse<String> injected = post(uiService, "/api/inject",
-                "{\"topic\":\"payment.commands\",\"messageType\":\"NoSuchCommand\",\"payload\":\"{}\"}");
+        HttpResponse<String> injected = admin.send("POST", "/api/inject",
+                "{\"topic\":\"payment.commands\",\"messageType\":\"NoSuchCommand\",\"payload\":\"{}\"}", true);
         assertThat(injected.statusCode()).as(injected.body()).isEqualTo(200);
         UUID messageId = UUID.fromString(JSON.readTree(injected.body()).get("messageIds").get(0).asString());
         kafka.awaitDeadLetter("payment.commands-dlt", messageId, DLT_TIMEOUT)
                 .orElseThrow(() -> new AssertionError("injected message " + messageId + " never dead-lettered"));
-        assertThat(post(uiService, "/api/inject", "{\"topic\":\"__consumer_offsets\",\"messageType\":\"X\",\"payload\":\"{}\"}")
+        assertThat(admin.send("POST", "/api/inject", "{\"topic\":\"__consumer_offsets\",\"messageType\":\"X\",\"payload\":\"{}\"}", true)
                 .statusCode()).isEqualTo(400);
+    }
+
+    // ---- security --------------------------------------------------------------------------------
+
+    private record Call(ServiceProcess service, String method, String path, String body) {
+    }
+
+    @Test
+    void services_enforceRolesPerEndpoint() throws Exception {
+        List<Call> calls = List.of(
+                new Call(orderService, "GET", "/actuator/health", null),
+                new Call(orderService, "GET", "/actuator/stucksagas", null),
+                new Call(orderService, "GET", "/orders?limit=1", null),
+                new Call(paymentService, "GET", "/customers", null),
+                new Call(inventoryService, "POST", "/actuator/dlt/inventory.commands", "{}"),
+                new Call(inventoryService, "PUT", "/products/sec-" + UUID.randomUUID(), "{\"availableQuantity\":1}"),
+                new Call(inventoryService, "DELETE", "/products/product-1", null));
+        // caller -> expected status for: health, read actuator, list orders, read credit, DLT replay, seed PUT, unlisted
+        Map<String, List<Integer>> expected = Map.of(
+                "none", List.of(200, 401, 401, 401, 401, 401, 401),
+                "viewer", List.of(200, 200, 200, 200, 403, 403, 403),
+                "operator", List.of(200, 200, 200, 200, 200, 403, 403),
+                "admin", List.of(200, 200, 200, 200, 200, 200, 403));
+        for (var entry : expected.entrySet()) {
+            String token = entry.getKey().equals("none") ? null : KEYCLOAK.token(entry.getKey());
+            List<Integer> actual = new ArrayList<>();
+            for (Call call : calls) {
+                HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(call.service().baseUrl() + call.path()))
+                        .header("Content-Type", "application/json")
+                        .method(call.method(), call.body() == null
+                                ? HttpRequest.BodyPublishers.noBody()
+                                : HttpRequest.BodyPublishers.ofString(call.body()));
+                if (token != null) {
+                    request.header("Authorization", "Bearer " + token);
+                }
+                actual.add(HTTP.send(request.build(), HttpResponse.BodyHandlers.discarding()).statusCode());
+            }
+            assertThat(actual).as("caller " + entry.getKey()).isEqualTo(entry.getValue());
+        }
+
+        // The customer-facing order API stays public
+        assertThat(postOrder("{\"customerId\":\"customer-1\",\"productId\":\"product-1\",\"quantity\":1,\"amount\":1.00}").statusCode())
+                .isEqualTo(201);
+    }
+
+    @Test
+    void services_rejectTokensFromTheWrongIssuer_andGarbage() throws Exception {
+        for (String token : List.of(KEYCLOAK.foreignRealmToken(), "not.a.jwt")) {
+            HttpResponse<Void> response = HTTP.send(HttpRequest.newBuilder(URI.create(orderService.baseUrl() + "/actuator/stucksagas"))
+                    .header("Authorization", "Bearer " + token).build(), HttpResponse.BodyHandlers.discarding());
+            assertThat(response.statusCode()).isEqualTo(401);
+            assertThat(response.headers().firstValue("WWW-Authenticate")).hasValueSatisfying(v -> assertThat(v).startsWith("Bearer"));
+        }
+    }
+
+    @Test
+    void prometheusClient_canScrapeMetrics_butNothingElse() throws Exception {
+        String token = KEYCLOAK.clientCredentialsToken("saga-prometheus", "saga-prometheus-dev-secret");
+        HttpResponse<String> scrape = HTTP.send(HttpRequest.newBuilder(URI.create(orderService.baseUrl() + "/actuator/prometheus"))
+                .header("Authorization", "Bearer " + token).build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(scrape.statusCode()).isEqualTo(200);
+        assertThat(scrape.body()).contains("saga_compensation_stuck");
+        assertThat(HTTP.send(HttpRequest.newBuilder(URI.create(orderService.baseUrl() + "/actuator/dlt"))
+                .header("Authorization", "Bearer " + token).build(), HttpResponse.BodyHandlers.discarding()).statusCode())
+                .isEqualTo(403);
+    }
+
+    @Test
+    void console_requiresLogin_relaysTheUsersToken_andChecksCsrfAndRoles() throws Exception {
+        // Not signed in: browsers go to Keycloak, API calls get a 401 the page can recognise
+        HttpClient anonymous = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build();
+        HttpResponse<Void> page = anonymous.send(HttpRequest.newBuilder(URI.create(uiService.baseUrl() + "/"))
+                .header("Accept", "text/html").build(), HttpResponse.BodyHandlers.discarding());
+        assertThat(page.statusCode()).isEqualTo(302);
+        assertThat(page.headers().firstValue("Location")).hasValueSatisfying(v -> assertThat(v).endsWith("/oauth2/authorization/keycloak"));
+        HttpResponse<Void> api = anonymous.send(HttpRequest.newBuilder(URI.create(uiService.baseUrl() + "/api/me")).build(),
+                HttpResponse.BodyHandlers.discarding());
+        assertThat(api.statusCode()).isEqualTo(401);
+        assertThat(api.headers().firstValue("X-Saga-Console-Login")).hasValue("true");
+
+        String inject = "{\"topic\":\"payment.commands\",\"messageType\":\"NoSuchCommand\",\"payload\":\"{}\"}";
+
+        // viewer: can read through the proxy, cannot act
+        ConsoleSession viewer = ConsoleSession.login(uiService.baseUrl(), "viewer", "viewer");
+        JsonNode me = JSON.readTree(viewer.get("/api/me").body());
+        assertThat(me.get("username").asString()).isEqualTo("viewer");
+        assertThat(me.get("roles").valueStream().map(JsonNode::asString)).containsExactly("saga-viewer");
+        assertThat(viewer.get("/api/order/actuator/stucksagas").statusCode()).isEqualTo(200);
+        assertThat(viewer.send("POST", "/api/payment/actuator/dlt/payment.commands", "{}", true).statusCode()).isEqualTo(403);
+        assertThat(viewer.send("POST", "/api/inject", inject, true).statusCode()).isEqualTo(403);
+
+        // operator: the CSRF header is required for state-changing calls; seed data stays admin-only
+        ConsoleSession operator = ConsoleSession.login(uiService.baseUrl(), "operator", "operator");
+        assertThat(JSON.readTree(operator.get("/api/me").body()).get("roles").valueStream().map(JsonNode::asString))
+                .containsExactlyInAnyOrder("saga-operator", "saga-viewer");
+        assertThat(operator.send("POST", "/api/inject", inject, false).statusCode()).isEqualTo(403);
+        assertThat(operator.send("POST", "/api/inject", inject, true).statusCode()).isEqualTo(200);
+        assertThat(operator.send("POST", "/api/payment/actuator/dlt/payment.commands", "{\"limit\":1}", true).statusCode()).isEqualTo(200);
+        assertThat(operator.send("PUT", "/api/inventory/products/sec-" + UUID.randomUUID(), "{\"availableQuantity\":1}", true)
+                .statusCode()).isEqualTo(403);
+    }
+
+    /** Protected endpoints: admin token by default (admin includes operator and viewer). */
+    private static HttpRequest.Builder authed(URI uri) {
+        return authedAs("admin", uri);
+    }
+
+    private static HttpRequest.Builder authedAs(String user, URI uri) {
+        return HttpRequest.newBuilder(uri).header("Authorization", "Bearer " + KEYCLOAK.token(user));
     }
 
     private static List<String> outboxTypes(ServiceProcess service, UUID orderId) throws Exception {
@@ -576,12 +691,12 @@ class SagaEndToEndIT {
     }
 
     private static int status(ServiceProcess service, String path) throws Exception {
-        return HTTP.send(HttpRequest.newBuilder(URI.create(service.baseUrl() + path)).build(),
+        return HTTP.send(authed(URI.create(service.baseUrl() + path)).build(),
                 HttpResponse.BodyHandlers.discarding()).statusCode();
     }
 
     private static HttpResponse<String> put(ServiceProcess service, String path, String body) throws Exception {
-        return HTTP.send(HttpRequest.newBuilder(URI.create(service.baseUrl() + path))
+        return HTTP.send(authed(URI.create(service.baseUrl() + path))
                         .header("Content-Type", "application/json")
                         .PUT(HttpRequest.BodyPublishers.ofString(body))
                         .build(),
@@ -589,7 +704,7 @@ class SagaEndToEndIT {
     }
 
     private static HttpResponse<String> post(ServiceProcess service, String path, String body) throws Exception {
-        return HTTP.send(HttpRequest.newBuilder(URI.create(service.baseUrl() + path))
+        return HTTP.send(authed(URI.create(service.baseUrl() + path))
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(body))
                         .build(),
@@ -617,7 +732,8 @@ class SagaEndToEndIT {
             assertThat(result.get("fromState").asString()).isEqualTo("COMPENSATING");
             assertThat(result.get("toState").asString()).isEqualTo("COMPENSATING");
             assertThat(result.get("compensationResends").asInt()).isZero();
-            assertThat(result.get("operator").asString()).isEqualTo("bob");
+            // The body said "bob"; the audit records the token's user
+            assertThat(result.get("operator").asString()).isEqualTo("operator");
         } finally {
             unblock(trigger);
         }
@@ -630,7 +746,7 @@ class SagaEndToEndIT {
         JsonNode history = sagaDetail(sagaId).get("interventions");
         assertThat(history).hasSize(1);
         assertThat(history.get(0).get("action").asString()).isEqualTo("RETRY");
-        assertThat(history.get(0).get("operator").asString()).isEqualTo("bob");
+        assertThat(history.get(0).get("operator").asString()).isEqualTo("operator");
     }
 
     @Test
@@ -691,8 +807,9 @@ class SagaEndToEndIT {
         assertThat(intervene(unknown, "{\"action\":\"retry\",\"operator\":\"bob\"}").statusCode()).isEqualTo(404);
         assertThat(intervene("not-a-uuid", "{\"action\":\"retry\",\"operator\":\"bob\"}").statusCode()).isEqualTo(400);
         assertThat(intervene(unknown, "{\"action\":\"explode\",\"operator\":\"bob\"}").statusCode()).isEqualTo(400);
-        assertThat(intervene(unknown, "{\"action\":\"retry\"}").statusCode()).isEqualTo(400);
-        assertThat(HTTP.send(HttpRequest.newBuilder(URI.create(orderService.baseUrl() + "/actuator/stucksagas/" + unknown)).build(),
+        // No operator in the body is fine: the identity comes from the token, so this is just an unknown saga
+        assertThat(intervene(unknown, "{\"action\":\"retry\"}").statusCode()).isEqualTo(404);
+        assertThat(HTTP.send(authed(URI.create(orderService.baseUrl() + "/actuator/stucksagas/" + unknown)).build(),
                 HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(404);
 
         // Not compensating -> 409
@@ -710,7 +827,7 @@ class SagaEndToEndIT {
     }
 
     private static HttpResponse<String> intervene(String sagaId, String body) throws Exception {
-        return HTTP.send(HttpRequest.newBuilder(URI.create(orderService.baseUrl() + "/actuator/stucksagas/" + sagaId))
+        return HTTP.send(authedAs("operator", URI.create(orderService.baseUrl() + "/actuator/stucksagas/" + sagaId))
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(body))
                         .build(),
@@ -821,7 +938,7 @@ class SagaEndToEndIT {
 
     private static String get(ServiceProcess service, String path) throws Exception {
         HttpResponse<String> response = HTTP.send(
-                HttpRequest.newBuilder(URI.create(service.baseUrl() + path)).build(),
+                authed(URI.create(service.baseUrl() + path)).build(),
                 HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).as(path + " -> " + response.body()).isEqualTo(200);
         return response.body();
@@ -829,14 +946,14 @@ class SagaEndToEndIT {
 
     private static JsonNode dltStatus(ServiceProcess service, String topic) throws Exception {
         HttpResponse<String> response = HTTP.send(
-                HttpRequest.newBuilder(URI.create(service.baseUrl() + "/actuator/dlt/" + topic)).build(),
+                authed(URI.create(service.baseUrl() + "/actuator/dlt/" + topic)).build(),
                 HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
         return JSON.readTree(response.body());
     }
 
     private static JsonNode replay(ServiceProcess service, String topic, String body) throws Exception {
-        HttpResponse<String> response = HTTP.send(HttpRequest.newBuilder(
+        HttpResponse<String> response = HTTP.send(authed(
                                 URI.create(service.baseUrl() + "/actuator/dlt/" + topic))
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(body))
@@ -905,7 +1022,8 @@ class SagaEndToEndIT {
                 Map.entry("saga.timeout.compensation", STEP_TIMEOUT.toMillis() + "ms"),
                 Map.entry("saga.timeout.scan-interval", "250ms"),
                 Map.entry("saga.alert.stuck-after-resends", String.valueOf(STUCK_AFTER_RESENDS)),
-                Map.entry("saga.alert.refresh-interval", "500ms")));
+                Map.entry("saga.alert.refresh-interval", "500ms"),
+                Map.entry("spring.security.oauth2.resourceserver.jwt.issuer-uri", KEYCLOAK.issuer())));
         SERVICES.add(service);
         return service;
     }

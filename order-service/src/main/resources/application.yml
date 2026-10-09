@@ -12,6 +12,16 @@ spring:
     open-in-view: false
     hibernate:
       ddl-auto: validate
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Keycloak realm "saga" (docker-compose). Tokens must carry aud=saga-api; roles come from the "roles" claim.
+          issuer-uri: http://localhost:8180/realms/saga
+          audiences: saga-api
+          authorities-claim-name: roles
+          authority-prefix: ROLE_
+          principal-claim-name: preferred_username
   kafka:
     bootstrap-servers: localhost:9092
     producer:

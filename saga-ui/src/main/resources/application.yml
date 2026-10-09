@@ -6,6 +6,20 @@ server:
 spring:
   application:
     name: saga-ui
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            client-id: saga-console
+            # Development secret from docker/keycloak/saga-realm.json; override via SAGA_CONSOLE_CLIENT_SECRET
+            client-secret: ${SAGA_CONSOLE_CLIENT_SECRET:saga-console-dev-secret}
+            authorization-grant-type: authorization_code
+            scope: openid,profile
+        provider:
+          keycloak:
+            # Fetched at startup: Keycloak must be up before the console starts
+            issuer-uri: http://localhost:8180/realms/saga
   kafka:
     bootstrap-servers: localhost:9092
     producer:

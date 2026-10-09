@@ -10,7 +10,8 @@ This document explains **what** the system does, **why** it is built this way, a
 - [6. Failure modes](#6-failure-modes)
 - [7. Data model](#7-data-model)
 - [8. Operability](#8-operability)
-- [9. Key decisions and trade-offs](#9-key-decisions-and-trade-offs)
+- [9. Security](#9-security)
+- [10. Key decisions and trade-offs](#10-key-decisions-and-trade-offs)
 
 ---
 
@@ -73,6 +74,7 @@ Every arrow between services is a Kafka topic: 3 partitions, keyed by orderId, w
 | saga-ui | 8080 (localhost only) | Browser console. Proxies to the services and injects raw Kafka messages |
 | PostgreSQL 17 | 5432 | One instance, three databases (`order_db`, `payment_db`, `inventory_db`), one per service |
 | Kafka 4.0 (KRaft) | 9092 (host), 29092 (compose network) | Three topics plus three dead-letter topics |
+| Keycloak 26.7 | 8180 | Identity provider (dev mode): realm `saga` with roles, clients and dev users; issues the JWTs every protected call needs |
 | AKHQ 0.28.0 | 8086 | Kafka web UI for local development: topics, messages and headers, consumer groups and lag. Not part of the saga |
 | saga-common | – | A library jar used by all three services (not a process) |
 
@@ -321,7 +323,65 @@ The gauges are recalculated from the database every 15 s (`saga.alert.refresh-in
 
 ---
 
-## 9. Key decisions and trade-offs
+## 9. Security
+
+**Who may do what.** Placing and reading an order, and health checks, are public. Everything administrative needs a token from Keycloak (realm `saga`) carrying the right **role**. The roles are composite, so each level includes the ones below it:
+
+| Role | Includes | Allows |
+|---|---|---|
+| `saga-viewer` | – | read actuator endpoints (DLT status, stuck sagas, outbox, metrics), participant state, the order list |
+| `saga-operator` | viewer | DLT replay, saga retry/resolve, message injection in the console |
+| `saga-admin` | operator | set customer credit and product stock (the seed `PUT`s) |
+| `saga-metrics` | – | `GET /actuator/prometheus` only (for the `saga-prometheus` client) |
+
+**The services are OAuth2 resource servers.** One rulebook, [`SagaSecurityConfig`](../saga-common/src/main/java/com/saga/common/security/SagaSecurityConfig.java) in saga-common, protects all three services.
+- **Validation:** each request's `Authorization: Bearer <JWT>` is checked against Keycloak's signing keys (fetched from the issuer's JWKS on first use), the issuer, and the audience `saga-api`.
+- **Roles and identity:** roles come from the token's `roles` claim. The identity is `preferred_username`.
+- **No sessions:** the services are stateless, so CSRF protection doesn't apply.
+- **Failures:** a missing or invalid token gets **401**; a valid token without the role gets **403**. Both carry a `WWW-Authenticate: Bearer …` header. Anything not listed is denied.
+
+**The console is an OIDC client.**
+- **Sign-in:** the browser signs in at Keycloak (authorization-code flow). The console keeps the user's tokens in its server-side session.
+- **Token relay:** the proxy relays the user's access token to the services and refreshes it when it expires. The browser never holds a token, only a session cookie.
+- **CSRF:** because of that cookie, every state-changing call from the page must echo the `XSRF-TOKEN` cookie in an `X-XSRF-TOKEN` header.
+- **Roles in the page:** the page reads the user's roles from `/api/me` and disables what they can't do. The services still enforce every rule themselves.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant UI as saga-ui console
+    participant KC as Keycloak
+    participant S as order/payment/inventory
+    B->>UI: GET /
+    UI-->>B: 302 to Keycloak login
+    B->>KC: sign in (operator / operator)
+    KC-->>B: 302 back with authorization code
+    B->>UI: /login/oauth2/code/keycloak?code=…
+    UI->>KC: exchange code for ID + access + refresh token
+    UI-->>B: session cookie
+    B->>UI: POST /api/order/actuator/stucksagas/{id} + X-XSRF-TOKEN
+    UI->>S: same request + Authorization: Bearer access-token
+    S->>S: verify signature, issuer, audience, role saga-operator
+    S-->>UI: 200 (audit records "operator")
+    UI-->>B: 200
+```
+
+**Other callers.**
+- **curl:** gets a token with the dev-only `saga-cli` client using the password grant (`ops\token.cmd`).
+- **Prometheus:** uses the client-credentials grant of `saga-prometheus` (`ops/prometheus/prometheus.yml`).
+
+**Operator identity.** The audit row of a retry or resolve records the **token's user**. The actuator `SecurityContext` principal wins over any `operator` field in the request body, so the audit trail can't be spoofed.
+
+**Issuer consistency.** A token's `iss` claim is the URL it was requested from, so everything uses the same Keycloak URL, `http://localhost:8180`. A token fetched from `http://127.0.0.1:8180` would be rejected by the services.
+
+**What is still open** (see [PROJECT.md](../PROJECT.md)):
+- Keycloak runs in dev mode (no database, HTTP, dev secrets and users in the realm file).
+- The customer-facing order API is public by design for now.
+- AKHQ is unauthenticated.
+
+---
+
+## 10. Key decisions and trade-offs
 
 | Decision | Why | Cost |
 |---|---|---|
@@ -331,7 +391,9 @@ The gauges are recalculated from the database every 15 s (`saga.alert.refresh-in
 | Timeout ⇒ compensate unconditionally | Correct whether the participant is dead or slow; no guessing | Some orders that would have succeeded slowly are rejected |
 | Tombstones for "nothing to undo" | Fences off late or replayed commands permanently | Extra rows; `payment.customer_id`/`amount` become nullable |
 | Separate `outbox`/`processed_message` per service | Each service stays independent and owns its schema | Some duplicate DDL across services |
-| Actuator endpoints for admin operations | Off unless exposed; can move behind a management port or security | Currently unauthenticated, the top open item |
+| Actuator endpoints for admin operations | Off unless exposed; one security rulebook covers them | – |
+| OAuth2/JWT with Keycloak, roles in the token | Real identities in the audit trail; one mechanism for console, curl and Prometheus; services stay stateless | An extra container; tokens expire after 5 minutes; issuer URL must be consistent |
+| Token relay through the console (no tokens in the browser) | The page can't leak a token; CSRF is handled once by Spring Security | The console holds sessions and must start after Keycloak |
 | Main classes in package `com.saga` | Component, entity and repository scanning pick up `saga-common` without `@EntityScan` | Two services can't share one JVM (they'd scan each other's beans), so e2e tests run real processes |
 
 The full decision log, configuration reference and Boot 4 gotchas are in [PROJECT.md](../PROJECT.md).

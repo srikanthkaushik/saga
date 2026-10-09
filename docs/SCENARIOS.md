@@ -4,7 +4,9 @@ Fourteen scenarios, ordered from "see it work" to "break it and fix it". Each ha
 
 > **Learn**: what the scenario teaches · **Do**: console steps and/or CMD commands · **See**: what to expect (real outputs) · **Why**: the code responsible · **Reset**: how to clean up, where needed
 
-**Setup:** everything running as in [Getting started](GETTING-STARTED.md) (infrastructure, three services, console at http://localhost:8080).
+**Setup:** everything running as in [Getting started](GETTING-STARTED.md) (infrastructure including Keycloak, three services, console at http://localhost:8080).
+- **Console:** sign in as `admin` / `admin`. The scenario buttons create customers and products, which needs the admin role. Scenario 12 shows what an `operator` sees.
+- **CMD:** get a token first with `call ops\token.cmd admin admin`. The commands below send it as `-H "Authorization: Bearer %TOKEN%"`. Placing and reading an order is public and needs none. Tokens last 5 minutes; on a 401, call `ops\token.cmd` again. See [Getting started §4](GETTING-STARTED.md#4-sign-in-users-roles-and-tokens).
 - Scenarios 1–7 and 10 work with default settings.
 - **Scenarios 8, 9, 11 and 12 need order-service started with fast timeouts**, otherwise you wait 30 s per step:
   ```
@@ -44,8 +46,8 @@ Fourteen scenarios, ordered from "see it work" to "break it and fix it". Each ha
 
 **Do (CMD):**
 ```
-curl -X PUT http://localhost:8082/customers/alice -H "Content-Type: application/json" -d "{\"availableCredit\":500}"
-curl -X PUT http://localhost:8083/products/widget -H "Content-Type: application/json" -d "{\"availableQuantity\":10}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8082/customers/alice -H "Content-Type: application/json" -d "{\"availableCredit\":500}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8083/products/widget -H "Content-Type: application/json" -d "{\"availableQuantity\":10}"
 curl -i -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":2,\"amount\":120.00}"
 ```
 
@@ -53,15 +55,15 @@ curl -i -X POST http://localhost:8081/orders -H "Content-Type: application/json"
 - **The POST returns at once.** `HTTP/1.1 201`, `Location: /orders/<id>`, with `"status":"PENDING","sagaState":"PAYMENT_PENDING"`.
 - **About a second later,** `curl http://localhost:8081/orders/%ORDER%` shows `"status":"APPROVED"` and `"sagaState":"COMPLETED"`.
 - **Participant state:**
-  - `curl http://localhost:8082/payments/%ORDER%` → `"status":"COMPLETED"`, amount 120.00
-  - `curl http://localhost:8083/reservations/%ORDER%` → `"status":"RESERVED"`, quantity 2
-  - `curl http://localhost:8082/customers/alice` → `380.00`
-  - `curl http://localhost:8083/products/widget` → `8`
+  - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → `"status":"COMPLETED"`, amount 120.00
+  - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/reservations/%ORDER%` → `"status":"RESERVED"`, quantity 2
+  - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/customers/alice` → `380.00`
+  - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/products/widget` → `8`
 - **The four messages,** one outbox per service:
   ```
-  curl http://localhost:8081/actuator/outbox/%ORDER%    → ProcessPayment, ReserveInventory   (commands)
-  curl http://localhost:8082/actuator/outbox/%ORDER%    → PaymentProcessed                   (reply)
-  curl http://localhost:8083/actuator/outbox/%ORDER%    → InventoryReserved                  (reply)
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/outbox/%ORDER%    → ProcessPayment, ReserveInventory   (commands)
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/actuator/outbox/%ORDER%    → PaymentProcessed                   (reply)
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/actuator/outbox/%ORDER%    → InventoryReserved                  (reply)
   ```
 - **Console:** a straight cobalt route Payment pending → Inventory pending → Completed, and four timeline rows (e.g. +25 ms, +420 ms, +750 ms, +950 ms).
 - **Logs:**
@@ -85,13 +87,13 @@ curl -i -X POST http://localhost:8081/orders -H "Content-Type: application/json"
 
 **Do (CMD):**
 ```
-curl -X PUT http://localhost:8082/customers/bob -H "Content-Type: application/json" -d "{\"availableCredit\":50}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8082/customers/bob -H "Content-Type: application/json" -d "{\"availableCredit\":50}"
 curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"bob\",\"productId\":\"widget\",\"quantity\":1,\"amount\":200.00}"
 ```
 
 **See:**
 - `"status":"REJECTED"`, `"rejectionReason":"Insufficient credit"`, `"sagaState":"FAILED"`.
-- `curl http://localhost:8082/payments/%ORDER%` → **404**: no charge was ever made.
+- `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → **404**: no charge was ever made.
 - **Only two messages:** `ProcessPayment` (order) and `PaymentFailed` (payment). Inventory is never contacted.
 - **Console:** one cobalt track, from Payment pending straight down to Failed.
 
@@ -109,15 +111,15 @@ curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d
 
 **Do (CMD):**
 ```
-curl -X PUT http://localhost:8082/customers/carol -H "Content-Type: application/json" -d "{\"availableCredit\":500}"
-curl -X PUT http://localhost:8083/products/gadget -H "Content-Type: application/json" -d "{\"availableQuantity\":0}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8082/customers/carol -H "Content-Type: application/json" -d "{\"availableCredit\":500}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8083/products/gadget -H "Content-Type: application/json" -d "{\"availableQuantity\":0}"
 curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"carol\",\"productId\":\"gadget\",\"quantity\":1,\"amount\":80.00}"
 ```
 
 **See:**
 - `"status":"REJECTED"`, `"rejectionReason":"Insufficient stock"`, `"sagaState":"FAILED"`.
-- `curl http://localhost:8082/payments/%ORDER%` → `"status":"REFUNDED"`. The charge happened and was reversed.
-- `curl http://localhost:8082/customers/carol` → back to `500.00`.
+- `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → `"status":"REFUNDED"`. The charge happened and was reversed.
+- `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/customers/carol` → back to `500.00`.
 - **Six messages, in this order:**
 
   | order (commands) | payment (replies) | inventory (replies) |
@@ -143,8 +145,8 @@ curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d
 
 **Do (CMD):**
 ```
-curl -X PUT http://localhost:8082/customers/dave -H "Content-Type: application/json" -d "{\"availableCredit\":1000}"
-curl -X PUT http://localhost:8083/products/gizmo -H "Content-Type: application/json" -d "{\"availableQuantity\":50}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8082/customers/dave -H "Content-Type: application/json" -d "{\"availableCredit\":1000}"
+curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8083/products/gizmo -H "Content-Type: application/json" -d "{\"availableQuantity\":50}"
 for /L %i in (1,1,10) do start /b curl -s -o NUL -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"dave\",\"productId\":\"gizmo\",\"quantity\":10,\"amount\":20.00}"
 ```
 (In a `.cmd` file write `%%i` instead of `%i`. If you re-run this, use a new customer id such as `dave2`, so the counts below only include this run.)
@@ -189,8 +191,8 @@ for /L %i in (1,1,2) do @echo messageId:99999999-2222-3333-4444-555555555555,mes
   docker exec saga-postgres psql -U saga -d payment_db -tAc "select count(*) from processed_message where message_id = '99999999-2222-3333-4444-555555555555'"
   ```
   → `1`. The second delivery found the id already recorded and was skipped.
-- **No second charge:** `curl http://localhost:8082/customers/alice` is unchanged. The processed delivery found a COMPLETED payment for the order and replied `PaymentProcessed` without debiting (business-key idempotency).
-- `curl http://localhost:8082/actuator/outbox/%ORDER%` has gained **exactly one** extra `PaymentProcessed`.
+- **No second charge:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/customers/alice` is unchanged. The processed delivery found a COMPLETED payment for the order and replied `PaymentProcessed` without debiting (business-key idempotency).
+- `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/actuator/outbox/%ORDER%` has gained **exactly one** extra `PaymentProcessed`.
 - **order window:** `Saga … in state COMPLETED ignoring PaymentProcessed (expected state PAYMENT_PENDING)`. The extra reply can't move a finished saga.
 
 **Why:** [`IdempotencyGuard.firstDelivery`](../saga-common/src/main/java/com/saga/common/idempotency/IdempotencyGuard.java) inserts into `processed_message` with `ON CONFLICT DO NOTHING`, in the handler's own transaction. `PaymentCommandHandler.process` checks for an existing payment for the order first. `OrderSagaOrchestrator.expectedState` is the state guard.
@@ -209,7 +211,7 @@ for /L %i in (1,1,2) do @echo messageId:99999999-2222-3333-4444-555555555555,mes
 **Do (CMD)** for the first one:
 ```
 curl -X POST http://localhost:8080/api/inject -H "Content-Type: application/json" -d "{\"topic\":\"payment.commands\",\"messageType\":\"NoSuchCommand\",\"payload\":\"{}\"}"
-curl http://localhost:8082/actuator/dlt/payment.commands
+curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/actuator/dlt/payment.commands
 ```
 
 **See** (payment window; real timings):
@@ -261,7 +263,7 @@ set ORDER=aaaaaaaa-0000-0000-0000-000000000007
 set SAGA=bbbbbbbb-0000-0000-0000-000000000007
 
 curl -X POST http://localhost:8080/api/inject -H "Content-Type: application/json" -d "{\"topic\":\"order.saga.replies\",\"key\":\"%ORDER%\",\"messageType\":\"PaymentProcessed\",\"payload\":\"{\\\"sagaId\\\":\\\"%SAGA%\\\",\\\"orderId\\\":\\\"%ORDER%\\\"}\"}"
-curl http://localhost:8081/actuator/dlt/order.saga.replies
+curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/dlt/order.saga.replies
 ```
 → `"pending":1`. The order window logs `Dead-lettered order.saga.replies-… : NonRetryableMessageException: Unknown saga bbbbbbbb-…`.
 
@@ -271,7 +273,7 @@ docker exec saga-postgres psql -U saga -d order_db -c "insert into orders (id, c
 ```
 Replay (or press **Replay** on the `order.saga.replies-dlt` card in the console):
 ```
-curl -X POST http://localhost:8081/actuator/dlt/order.saga.replies -H "Content-Type: application/json" -d "{}"
+curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8081/actuator/dlt/order.saga.replies -H "Content-Type: application/json" -d "{}"
 ```
 → `{"topic":"order.saga.replies","dltTopic":"order.saga.replies-dlt","replayed":1,"pending":0}`
 
@@ -314,7 +316,7 @@ curl -X POST http://localhost:8081/actuator/dlt/order.saga.replies -H "Content-T
 
 The result:
 - **Order:** `"status":"REJECTED"`, `"rejectionReason":"Payment timed out"`, `"sagaState":"FAILED"`.
-- **Payment:** `curl http://localhost:8082/payments/%ORDER%` → `"status":"REFUNDED"`.
+- **Payment:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → `"status":"REFUNDED"`.
 - **Credit:** alice's credit is the same as before the order.
 - **order window:** `ignoring PaymentProcessed (expected state PAYMENT_PENDING)`, the late success reply, dropped.
 - **Console:** amber track Payment pending → Refunding payment ("payment timeout") → Failed. The timeline shows one ProcessPayment followed by many RefundPayment rows.
@@ -333,7 +335,7 @@ The result:
 **Learn:** a two-step compensation. Release the (possibly late) reservation, then refund.
 
 **Do:**
-1. Make sure widget has stock (`curl -X PUT http://localhost:8083/products/widget -H "Content-Type: application/json" -d "{\"availableQuantity\":10}"`), then close the **inventory** window.
+1. Make sure widget has stock (`curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8083/products/widget -H "Content-Type: application/json" -d "{\"availableQuantity\":10}"`), then close the **inventory** window.
 2. Place an order:
    ```
    curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":3,\"amount\":60.00}"
@@ -343,7 +345,7 @@ The result:
 
 **See:**
 - **Order:** `"status":"REJECTED"`, `"rejectionReason":"Inventory timed out"`.
-- **Reservation:** `curl http://localhost:8083/reservations/%ORDER%` → `"status":"RELEASED"`. The late reservation was made, then released.
+- **Reservation:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/reservations/%ORDER%` → `"status":"RELEASED"`. The late reservation was made, then released.
 - **Stock and payment:** stock is back to `10`, the payment is `REFUNDED`, and alice's credit is back where it started.
 - **Messages:**
   - order: `ProcessPayment, ReserveInventory, ReleaseInventory ×N, RefundPayment`
@@ -370,10 +372,10 @@ curl -X POST http://localhost:8080/api/inject -H "Content-Type: application/json
 ```
 
 **See:**
-- **The tombstone:** `curl http://localhost:8083/reservations/%ORDER%` → `"status":"RELEASED"`, quantity 1. The release found nothing and recorded one.
-- **No stock taken:** `curl http://localhost:8083/products/widget` is unchanged. The late reserve was refused.
+- **The tombstone:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/reservations/%ORDER%` → `"status":"RELEASED"`, quantity 1. The release found nothing and recorded one.
+- **No stock taken:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/products/widget` is unchanged. The late reserve was refused.
 - **Order:** `"status":"REJECTED"`, `"rejectionReason":"Order already released"`. The refusal (`InventoryFailed`) made the saga compensate.
-- **Payment:** `curl http://localhost:8082/payments/%ORDER%` → `"status":"CANCELLED"`. That refund found no payment either, so it left a payment tombstone, fencing off any late ProcessPayment for this order too.
+- **Payment:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → `"status":"CANCELLED"`. That refund found no payment either, so it left a payment tombstone, fencing off any late ProcessPayment for this order too.
 
 **Why:**
 - `InventoryCommandHandler.release` inserts `Reservation.tombstone(...)`, and `reserve` refuses when a RELEASED row exists.
@@ -400,14 +402,14 @@ curl -X POST http://localhost:8080/api/inject -H "Content-Type: application/json
 - **order window:** `STUCK COMPENSATION: saga … for order … in COMPENSATING has re-sent its compensation 3 times (compensating since …, reason: Payment timed out). See GET /actuator/stucksagas`. After that, one `still stuck … after N compensation re-sends` line per re-send.
 - **The stuck list:**
   ```
-  curl http://localhost:8081/actuator/stucksagas
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/stucksagas
   ```
   ```
   [{"sagaId":"…","orderId":"…","state":"COMPENSATING","failureReason":"Payment timed out","compensationResends":3,"compensatingSince":"…","deadline":"…"}]
   ```
-- **The gauge:** `curl http://localhost:8081/actuator/metrics/saga.compensation.stuck` → `"value":1.0`.
+- **The gauge:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/metrics/saga.compensation.stuck` → `"value":1.0`.
 - **Console:** the **Stuck sagas** tile turns red and the saga is listed.
-- **Prometheus:** `curl http://localhost:8081/actuator/prometheus | findstr saga_compensation` shows `saga_compensation_stuck 1.0`. That is what the `SagaCompensationStuck` alert in [`ops/prometheus/saga-alerts.yml`](../ops/prometheus/saga-alerts.yml) watches.
+- **Prometheus:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/prometheus | findstr saga_compensation` shows `saga_compensation_stuck 1.0`. That is what the `SagaCompensationStuck` alert in [`ops/prometheus/saga-alerts.yml`](../ops/prometheus/saga-alerts.yml) watches.
 
 **Recover:** either restart payment-service (it recovers as in Scenario 8, and the saga drops off the list), or go on to Scenario 12 with the saga still stuck.
 
@@ -422,21 +424,24 @@ curl -X POST http://localhost:8080/api/inject -H "Content-Type: application/json
 **Learn:** the two operator actions, why `resolve` needs a manual compensation first, and the audit trail. The [Runbook](../ops/RUNBOOK.md) is the production version of this.
 
 **Do (console):** Operations → **Open order** on the stuck saga. In the Saga card:
-1. Enter your name → **Retry compensation**. The re-send count drops to 0 (the refund was re-sent now). Payment is still down, so it will become stuck again after 3 more timeouts.
+To see the role split, sign out and sign in as `operator` / `operator`: the scenario buttons are now disabled (they need admin), but retry and resolve work.
+
+1. **Retry compensation**. The re-send count drops to 0 (the refund was re-sent now). Payment is still down, so it will become stuck again after 3 more timeouts.
 2. Click **Resolve as failed** without a note. It's refused: *note is required for resolve*.
 
-**Do (CMD)** for the same steps, with the saga id from `/actuator/stucksagas`:
+**Do (CMD)** for the same steps, with the saga id from `/actuator/stucksagas`. The audit records **the token's user**: any `operator` field in the body is ignored.
 ```
+call ops\token.cmd operator operator
 set SAGA=<saga id>
-curl -X POST http://localhost:8081/actuator/stucksagas/%SAGA% -H "Content-Type: application/json" -d "{\"action\":\"retry\",\"operator\":\"alice-oncall\"}"
+curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8081/actuator/stucksagas/%SAGA% -H "Content-Type: application/json" -d "{\"action\":\"retry\"}"
 ```
-→ `"action":"RETRY","fromState":"COMPENSATING","toState":"COMPENSATING","compensationResends":0`
+→ `"action":"RETRY","operator":"operator","fromState":"COMPENSATING","toState":"COMPENSATING","compensationResends":0`
 
 **Compensate by hand, then resolve.** Payment-service never charged this order (it was down), so the correct manual compensation is a **CANCELLED tombstone**: it fences off the queued ProcessPayment.
 ```
 set ORDER=<order id>
 docker exec saga-postgres psql -U saga -d payment_db -c "insert into payment (id, order_id, status, created_at, updated_at) values (gen_random_uuid(), '%ORDER%', 'CANCELLED', now(), now());"
-curl -X POST http://localhost:8081/actuator/stucksagas/%SAGA% -H "Content-Type: application/json" -d "{\"action\":\"resolve\",\"operator\":\"alice-oncall\",\"note\":\"Payment-service down; nothing charged; CANCELLED tombstone inserted, ticket OPS-42\"}"
+curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8081/actuator/stucksagas/%SAGA% -H "Content-Type: application/json" -d "{\"action\":\"resolve\",\"note\":\"Payment-service down; nothing charged; CANCELLED tombstone inserted, ticket OPS-42\"}"
 ```
 → `"toState":"FAILED","orderStatus":"REJECTED"`. The order now reads `"rejectionReason":"Payment timed out (compensation resolved manually)"`.
 
@@ -444,13 +449,13 @@ Now start payment-service again.
 
 **See:**
 - **The queued charge is refused:** the payment outbox shows `PaymentFailed` with `"reason":"Order already CANCELLED"`. The queued refunds are no-ops (`PaymentRefunded`).
-- **No money moved:** alice's credit is unchanged, and `curl http://localhost:8082/payments/%ORDER%` → `"status":"CANCELLED"`.
+- **No money moved:** alice's credit is unchanged, and `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → `"status":"CANCELLED"`.
 - **order window:** `Saga … in state FAILED ignoring PaymentFailed …` and `… ignoring PaymentRefunded …`. The saga is closed and late replies can't reopen it.
-- **The audit trail:** `curl http://localhost:8081/actuator/stucksagas/%SAGA%` → `"interventions":[{"action":"RETRY","operator":"alice-oncall",…},{"action":"RESOLVE",…,"note":"Payment-service down; …"}]`. The console shows both in the saga card and the timeline.
+- **The audit trail:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/stucksagas/%SAGA%` → `"interventions":[{"action":"RETRY","operator":"operator",…},{"action":"RESOLVE",…,"note":"Payment-service down; …"}]`. The console shows both in the saga card and the timeline.
 
 **The rule this demonstrates:** *compensate by hand **in the participant's own records** before resolving.* If the payment had been charged, you would mark it REFUNDED and restore the credit instead; the [Runbook](../ops/RUNBOOK.md#3b-cannot-be-fixed-in-time--compensate-by-hand-then-resolve) has the SQL. Either way, anything still queued becomes a no-op, so there's no double refund. The e2e test `resolve_afterManualRefund_closesSaga_andLateCompensationDoesNotRefundTwice` proves the charged variant.
 
-**Why:** [`SagaInterventionService.intervene`](../order-service/src/main/java/com/saga/order/saga/intervention/SagaInterventionService.java) (optimistic lock, audit row in `saga_intervention`, WARN log `Operator … applied …`).
+**Why:** [`SagaInterventionService.intervene`](../order-service/src/main/java/com/saga/order/saga/intervention/SagaInterventionService.java) (optimistic lock, audit row in `saga_intervention`, WARN log `Operator … applied …`). The operator name comes from the access token (`preferred_username`), via the actuator `SecurityContext` in [`StuckSagasEndpoint`](../order-service/src/main/java/com/saga/order/saga/StuckSagasEndpoint.java). The action needs the `saga-operator` role; a viewer gets 403.
 
 ---
 
@@ -461,10 +466,10 @@ Now start payment-service again.
 | Question | Look at |
 |---|---|
 | What happened to this order? | Console order detail, or `GET /actuator/outbox/{orderId}` on all three services (commands from order-service, replies from the participants) |
-| What is actually on the topics? | AKHQ at http://localhost:8086: messages, headers, Live Tail, search by key (orderId) ([Getting started §8](GETTING-STARTED.md#kafka-in-the-browser-akhq)) |
-| Is a message stuck? | `GET /actuator/dlt` on each service. Kafka lag: AKHQ's **Consumer Groups**, or `kafka-consumer-groups.sh --describe --group <service>` ([Getting started §8](GETTING-STARTED.md#kafka-from-the-command-line)) |
+| What is actually on the topics? | AKHQ at http://localhost:8086: messages, headers, Live Tail, search by key (orderId) ([Getting started §9](GETTING-STARTED.md#kafka-in-the-browser-akhq)) |
+| Is a message stuck? | `GET /actuator/dlt` on each service. Kafka lag: AKHQ's **Consumer Groups**, or `kafka-consumer-groups.sh --describe --group <service>` ([Getting started §9](GETTING-STARTED.md#kafka-from-the-command-line)) |
 | Is any compensation stuck? | `GET /actuator/stucksagas`, the gauge `saga.compensation.stuck`, the log line `STUCK COMPENSATION` |
-| Which metrics exist? | `curl http://localhost:8081/actuator/metrics`, and `curl http://localhost:8081/actuator/prometheus \| findstr saga_` |
+| Which metrics exist? | `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/metrics`, and `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/prometheus \| findstr saga_` |
 | Will the alerts fire correctly? | Run the promtool tests: `docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prometheus test rules /rules/saga-alerts.test.yml` → `SUCCESS` |
 | Is a service healthy? | `GET /actuator/health`, or the dots in the console header |
 
