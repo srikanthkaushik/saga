@@ -280,8 +280,26 @@ async function runScenario(sc) {
         const placed = results.filter((r) => r.ok);
         if (placed.length === 0) throw new Error(`No order was placed: ${errorText(results[0])}`);
 
-        note.textContent = `${sc.note} Customer ${customerId} started with ${money(sc.credit)} credit; the product had ${sc.stock} in stock.`;
-        selectOrder(placed[0].data.id);
+        const setup = `Customer ${customerId} started with ${money(sc.credit)} credit; the product had ${sc.stock} in stock.`;
+        if (placed.length === 1) {
+            note.textContent = `${sc.note} ${setup}`;
+            selectOrder(placed[0].data.id);
+        } else {
+            // Several orders: wait for all of them, report the split, and open a compensated one if there is one -
+            // otherwise the order that happened to answer first (usually an approved one) hides the refunds.
+            selectOrder(placed[0].data.id);
+            note.textContent = `Placed ${placed.length} orders at once. Waiting for all of them to finish…`;
+            const outcomes = await awaitOutcomes(placed.map((r) => r.data.id));
+            const approved = outcomes.filter((o) => o.status === 'APPROVED');
+            const rejected = outcomes.filter((o) => o.status === 'REJECTED');
+            const unfinished = outcomes.length - approved.length - rejected.length;
+            const shown = rejected[0] || approved[0] || outcomes[0];
+            note.textContent = `${sc.note} ${setup} Result: ${approved.length} approved, ${rejected.length} rejected and refunded`
+                + `${unfinished ? `, ${unfinished} still running` : ''}. `
+                + `Showing ${shown.status === 'REJECTED' ? 'a rejected one, so you can see the compensation' : 'one of them'}; `
+                + 'the others are under Recent orders.';
+            selectOrder(shown.id);
+        }
         once('options', loadOrderOptions);
     } catch (e) {
         note.className = 'error';
@@ -300,6 +318,19 @@ const OPTIONS_KEY = 'saga-console-order-options';
 
 function rememberedOptions() {
     try { return JSON.parse(localStorage.getItem(OPTIONS_KEY)) || {}; } catch { return {}; }
+}
+
+/** Polls the (public) order endpoint until every order has left PENDING, or the time is up. */
+async function awaitOutcomes(orderIds, timeoutMs = 60000) {
+    const deadline = Date.now() + timeoutMs;
+    let outcomes = [];
+    while (Date.now() < deadline) {
+        const results = await Promise.all(orderIds.map((id) => get('order', `/orders/${id}`)));
+        outcomes = results.map((r, i) => (r.ok ? r.data : { id: orderIds[i], status: 'UNKNOWN' }));
+        if (outcomes.every((o) => o.status === 'APPROVED' || o.status === 'REJECTED')) break;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return outcomes;
 }
 
 async function loadOrderOptions() {

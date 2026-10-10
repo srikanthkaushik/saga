@@ -141,7 +141,7 @@ curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d
 
 **Learn:** concurrency control. Pessimistic row locks stop overselling, and the losers are compensated.
 
-**Do (console):** **Ten orders at once**. It creates a customer with 1000.00 credit and a product with 50 in stock, then fires ten orders of 10 units each at the same moment.
+**Do (console):** **Ten orders at once**. It creates a customer with 1000.00 credit and a product with 50 in stock, then fires ten orders of 10 units each at the same moment. It waits for all ten, reports the split ("Result: 5 approved, 5 rejected and refunded"), and opens one of the rejected orders so you see the compensation. The other nine are under **Recent orders**.
 
 **Do (CMD):**
 ```
