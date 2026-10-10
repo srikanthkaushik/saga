@@ -94,6 +94,7 @@ class SagaEndToEndIT {
     private static ServiceProcess orderService;
     private static ServiceProcess paymentService;
     private static ServiceProcess inventoryService;
+    private static ServiceProcess shippingService;
     private static ServiceProcess uiService;
     private static KafkaProbe kafka;
 
@@ -103,11 +104,13 @@ class SagaEndToEndIT {
         orderService = launch("order-service", "saga.e2e.order-jar", "order_db", logDir);
         paymentService = launch("payment-service", "saga.e2e.payment-jar", "payment_db", logDir);
         inventoryService = launch("inventory-service", "saga.e2e.inventory-jar", "inventory_db", logDir);
+        shippingService = launch("shipping-service", "saga.e2e.shipping-jar", "shipping_db", logDir);
         uiService = ServiceProcess.start("saga-ui", Path.of(System.getProperty("saga.e2e.ui-jar")), logDir, Map.of(
                 "spring.kafka.bootstrap-servers", KAFKA.getBootstrapServers(),
                 "saga.ui.services.order", orderService.baseUrl(),
                 "saga.ui.services.payment", paymentService.baseUrl(),
                 "saga.ui.services.inventory", inventoryService.baseUrl(),
+                "saga.ui.services.shipping", shippingService.baseUrl(),
                 "spring.security.oauth2.client.provider.keycloak.issuer-uri", KEYCLOAK.issuer()));
         SERVICES.add(uiService);
         KEYCLOAK.allowConsoleAt(uiService.baseUrl());
@@ -128,19 +131,72 @@ class SagaEndToEndIT {
     }
 
     @Test
-    void happyPath_approvesOrder_debitsCreditAndReservesStock() throws Exception {
+    void happyPath_approvesOrder_debitsCredit_reservesStock_andSchedulesShipment() throws Exception {
         String customer = seedCustomer("1000.00");
         String product = seedProduct(10);
 
-        UUID orderId = placeOrder(customer, product, 3, "250.00");
+        UUID orderId = placeOrder(customer, product, 3, "250.00", "US");
         JsonNode order = awaitTerminal(orderId);
 
         assertThat(order.get("status").asString()).isEqualTo("APPROVED");
         assertThat(order.get("sagaState").asString()).isEqualTo("COMPLETED");
+        assertThat(order.get("destination").asString()).isEqualTo("US");
         assertThat(credit(customer)).isEqualByComparingTo("750.00");
         assertThat(paymentStatus(orderId)).isEqualTo("COMPLETED");
         assertThat(stock(product)).isEqualTo(7);
         assertThat(reservationCount(orderId)).isEqualTo(1);
+
+        JsonNode shipment = JSON.readTree(get(shippingService, "/shipments/" + orderId));
+        assertThat(shipment.get("status").asString()).isEqualTo("SCHEDULED");
+        assertThat(shipment.get("destination").asString()).isEqualTo("US");
+        assertThat(shipment.get("trackingNumber").asString()).startsWith("TRK-");
+        assertThat(outboxTypes(orderService, orderId)).containsExactly("ProcessPayment", "ReserveInventory", "ScheduleShipment");
+        assertThat(outboxTypes(shippingService, orderId)).containsExactly("ShipmentScheduled");
+    }
+
+    @Test
+    void orderWithoutDestination_shipsToTheDefaultCountry() throws Exception {
+        UUID orderId = placeOrder(seedCustomer("100.00"), seedProduct(5), 1, "10.00");
+        assertThat(awaitTerminal(orderId).get("destination").asString()).isEqualTo("GB");
+        assertThat(shipmentStatus(orderId)).isEqualTo("SCHEDULED");
+        assertThat(postOrder("{\"customerId\":\"c\",\"productId\":\"p\",\"quantity\":1,\"amount\":1.00,\"destination\":\"gbr\"}")
+                .statusCode()).isEqualTo(400);
+    }
+
+    @Test
+    void unshippableDestination_releasesStock_thenRefunds_inReverseOrder() throws Exception {
+        String customer = seedCustomer("100.00");
+        String product = seedProduct(5);
+
+        UUID orderId = placeOrder(customer, product, 2, "60.00", "XX");
+        JsonNode order = awaitTerminal(orderId);
+
+        assertThat(order.get("status").asString()).isEqualTo("REJECTED");
+        assertThat(order.get("sagaState").asString()).isEqualTo("FAILED");
+        assertThat(order.get("rejectionReason").asString()).isEqualTo("No carrier serves XX");
+        assertThat(shipmentStatus(orderId)).isNull();
+        assertThat(reservationStatus(orderId)).isEqualTo("RELEASED");
+        assertThat(stock(product)).isEqualTo(5);
+        assertThat(paymentStatus(orderId)).isEqualTo("REFUNDED");
+        assertThat(credit(customer)).isEqualByComparingTo("100.00");
+        // Compensation runs backwards through the steps that succeeded: inventory first, then payment
+        assertThat(outboxTypes(orderService, orderId))
+                .containsExactly("ProcessPayment", "ReserveInventory", "ScheduleShipment", "ReleaseInventory", "RefundPayment");
+        assertThat(outboxTypes(shippingService, orderId)).containsExactly("ShipmentFailed");
+    }
+
+    @Test
+    void closingAShippingZone_makesOrdersToItFail() throws Exception {
+        String country = "QZ";
+        assertThat(put(shippingService, "/zones/" + country, "{\"served\":false,\"name\":\"e2e\"}").statusCode()).isEqualTo(200);
+        UUID refused = placeOrder(seedCustomer("100.00"), seedProduct(5), 1, "10.00", country);
+        assertThat(awaitTerminal(refused).get("rejectionReason").asString()).isEqualTo("No carrier serves " + country);
+
+        assertThat(put(shippingService, "/zones/" + country, "{\"served\":true}").statusCode()).isEqualTo(200);
+        UUID shipped = placeOrder(seedCustomer("100.00"), seedProduct(5), 1, "10.00", country);
+        assertThat(awaitTerminal(shipped).get("status").asString()).isEqualTo("APPROVED");
+        assertThat(JSON.readTree(get(shippingService, "/zones/" + country)).get("name").asString()).isEqualTo("e2e");
+        assertThat(put(shippingService, "/zones/qq", "{\"served\":true}").statusCode()).isEqualTo(400);
     }
 
     @Test
@@ -411,6 +467,52 @@ class SagaEndToEndIT {
     }
 
     @Test
+    @Order(AFTER_EVERYTHING_ELSE)
+    void shippingTimeout_cancelsTheLateShipment_releasesStock_refunds_andRejectsOrder() throws Exception {
+        String customer = seedCustomer("100.00");
+        String product = seedProduct(5);
+        // quantity=-1 in a served zone violates shipment's CHECK (quantity > 0) -> retryable
+        stallAllPartitions("shipping.commands", "ScheduleShipment", () -> JSON.writeValueAsString(Map.of(
+                "sagaId", UUID.randomUUID(), "orderId", UUID.randomUUID(), "productId", "poison", "quantity", -1,
+                "destination", "GB")));
+
+        UUID orderId = placeOrder(customer, product, 2, "40.00");
+        JsonNode order = awaitTerminal(orderId);
+
+        assertThat(order.get("status").asString()).isEqualTo("REJECTED");
+        assertThat(order.get("sagaState").asString()).isEqualTo("FAILED");
+        assertThat(order.get("rejectionReason").asString()).isEqualTo("Shipping timed out");
+        // The stalled ScheduleShipment still ran after the timeout - and the queued cancel undid it
+        assertThat(shipmentStatus(orderId)).isEqualTo("CANCELLED");
+        assertThat(reservationStatus(orderId)).isEqualTo("RELEASED");
+        assertThat(stock(product)).isEqualTo(5);
+        assertThat(paymentStatus(orderId)).isEqualTo("REFUNDED");
+        assertThat(credit(customer)).isEqualByComparingTo("100.00");
+        assertThat(outboxTypes(orderService, orderId)).startsWith(
+                "ProcessPayment", "ReserveInventory", "ScheduleShipment", "CancelShipment");
+    }
+
+    @Test
+    void cancelBeforeSchedule_leavesTombstone_andRefusesTheLateShipment() throws Exception {
+        String customer = seedCustomer("100.00");
+        String product = seedProduct(5);
+        UUID orderId = UUID.randomUUID();
+        UUID sagaId = UUID.randomUUID();
+        seedSaga(orderId, sagaId, "SHIPPING_PENDING", customer, product);
+
+        kafka.send("shipping.commands", orderId.toString(), "CancelShipment",
+                JSON.writeValueAsString(Map.of("sagaId", sagaId, "orderId", orderId)));
+        kafka.send("shipping.commands", orderId.toString(), "ScheduleShipment", JSON.writeValueAsString(Map.of(
+                "sagaId", sagaId, "orderId", orderId, "productId", product, "quantity", 1, "destination", "GB")));
+
+        JsonNode order = awaitTerminal(orderId);
+        assertThat(order.get("status").asString()).isEqualTo("REJECTED");
+        assertThat(order.get("rejectionReason").asString()).isEqualTo("Order already cancelled");
+        assertThat(shipmentStatus(orderId)).isEqualTo("CANCELLED");
+        assertThat(stock(product)).isEqualTo(5);
+    }
+
+    @Test
     void refundBeforeCharge_leavesTombstone_andRefusesTheLateCharge() throws Exception {
         String customer = seedCustomer("100.00");
         String product = seedProduct(5);
@@ -564,6 +666,7 @@ class SagaEndToEndIT {
         assertThat(admin.get("/api/order/orders/" + UUID.randomUUID()).statusCode()).isEqualTo(404);
         assertThat(admin.get("/api/somewhere/else").statusCode()).isEqualTo(404);
         assertThat(admin.get("/api/order/actuator/prometheus").body()).contains("saga_compensation_stuck");
+        assertThat(admin.get("/api/shipping/shipments/" + orderId).body()).contains("SCHEDULED");
 
         // Injection publishes in the services' wire format
         HttpResponse<String> injected = admin.send("POST", "/api/inject",
@@ -590,13 +693,16 @@ class SagaEndToEndIT {
                 new Call(paymentService, "GET", "/customers", null),
                 new Call(inventoryService, "POST", "/actuator/dlt/inventory.commands", "{}"),
                 new Call(inventoryService, "PUT", "/products/sec-" + UUID.randomUUID(), "{\"availableQuantity\":1}"),
-                new Call(inventoryService, "DELETE", "/products/product-1", null));
-        // caller -> expected status for: health, read actuator, list orders, read credit, DLT replay, seed PUT, unlisted
+                new Call(inventoryService, "DELETE", "/products/product-1", null),
+                new Call(shippingService, "GET", "/zones", null),
+                new Call(shippingService, "PUT", "/zones/ZZ", "{\"served\":true}"));
+        // caller -> expected status for: health, read actuator, list orders, read credit, DLT replay, seed PUT, unlisted,
+        // read zones, change a zone
         Map<String, List<Integer>> expected = Map.of(
-                "none", List.of(200, 401, 401, 401, 401, 401, 401),
-                "viewer", List.of(200, 200, 200, 200, 403, 403, 403),
-                "operator", List.of(200, 200, 200, 200, 200, 403, 403),
-                "admin", List.of(200, 200, 200, 200, 200, 200, 403));
+                "none", List.of(200, 401, 401, 401, 401, 401, 401, 401, 401),
+                "viewer", List.of(200, 200, 200, 200, 403, 403, 403, 200, 403),
+                "operator", List.of(200, 200, 200, 200, 200, 403, 403, 200, 403),
+                "admin", List.of(200, 200, 200, 200, 200, 200, 403, 200, 200));
         for (var entry : expected.entrySet()) {
             String token = entry.getKey().equals("none") ? null : KEYCLOAK.token(entry.getKey());
             List<Integer> actual = new ArrayList<>();
@@ -1019,6 +1125,7 @@ class SagaEndToEndIT {
                 Map.entry("saga.kafka.retry.multiplier", "2.0"),
                 Map.entry("saga.timeout.payment", STEP_TIMEOUT.toMillis() + "ms"),
                 Map.entry("saga.timeout.inventory", STEP_TIMEOUT.toMillis() + "ms"),
+                Map.entry("saga.timeout.shipping", STEP_TIMEOUT.toMillis() + "ms"),
                 Map.entry("saga.timeout.compensation", STEP_TIMEOUT.toMillis() + "ms"),
                 Map.entry("saga.timeout.scan-interval", "250ms"),
                 Map.entry("saga.alert.stuck-after-resends", String.valueOf(STUCK_AFTER_RESENDS)),
@@ -1030,12 +1137,22 @@ class SagaEndToEndIT {
 
     // ---- HTTP -----------------------------------------------------------------------------------
 
+    /** Without a destination: order-service ships to its default country (GB). */
     private static UUID placeOrder(String customerId, String productId, int quantity, String amount) throws Exception {
-        String body = JSON.writeValueAsString(Map.of(
+        return placeOrder(customerId, productId, quantity, amount, null);
+    }
+
+    private static UUID placeOrder(String customerId, String productId, int quantity, String amount, String destination)
+            throws Exception {
+        Map<String, Object> request = new HashMap<>(Map.of(
                 "customerId", customerId,
                 "productId", productId,
                 "quantity", quantity,
                 "amount", new BigDecimal(amount)));
+        if (destination != null) {
+            request.put("destination", destination);
+        }
+        String body = JSON.writeValueAsString(request);
         HttpResponse<String> response = postOrder(body);
         assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
         return UUID.fromString(JSON.readTree(response.body()).get("id").asString());
@@ -1115,6 +1232,11 @@ class SagaEndToEndIT {
 
     private static String reservationStatus(UUID orderId) throws SQLException {
         return querySingle("inventory_db", "select status from reservation where order_id = ?",
+                orderId, rs -> rs.getString(1));
+    }
+
+    private static String shipmentStatus(UUID orderId) throws SQLException {
+        return querySingle("shipping_db", "select status from shipment where order_id = ?",
                 orderId, rs -> rs.getString(1));
     }
 

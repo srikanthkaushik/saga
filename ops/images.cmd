@@ -1,6 +1,6 @@
 @echo off
 setlocal
-rem Builds the six deployment images (and optionally pushes them) from the repository root.
+rem Builds the deployment images (and optionally pushes them) from the repository root.
 rem   ops\images.cmd                  build, tag :latest
 rem   ops\images.cmd 2026.10.09       build, tag :2026.10.09 and :latest
 rem   ops\images.cmd 2026.10.09 push  build, tag both, push both
@@ -17,7 +17,7 @@ call mvn -q clean package -DskipITs
 if errorlevel 1 exit /b 1
 
 echo == Building images %SAGA_REGISTRY%/saga-*:%TAG%
-for %%m in (order-service payment-service inventory-service) do (
+for %%m in (order-service payment-service inventory-service shipping-service) do (
     docker build -q -f docker\app.Dockerfile --build-arg MODULE=%%m -t %SAGA_REGISTRY%/saga-%%m:%TAG% -t %SAGA_REGISTRY%/saga-%%m:latest .
     if errorlevel 1 exit /b 1
 )
@@ -33,7 +33,7 @@ if /i not "%~2"=="push" (
     exit /b 0
 )
 echo == Pushing
-for %%i in (order-service payment-service inventory-service console keycloak postgres) do (
+for %%i in (order-service payment-service inventory-service shipping-service console keycloak postgres) do (
     docker push -q %SAGA_REGISTRY%/saga-%%i:%TAG%
     if errorlevel 1 exit /b 1
     if /i not "%TAG%"=="latest" (

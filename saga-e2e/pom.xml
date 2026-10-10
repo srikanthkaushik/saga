@@ -60,6 +60,18 @@
         </dependency>
         <dependency>
             <groupId>com.saga</groupId>
+            <artifactId>shipping-service</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>com.saga</groupId>
             <artifactId>saga-ui</artifactId>
             <version>${project.version}</version>
             <scope>test</scope>
@@ -141,6 +153,7 @@
                         <saga.e2e.order-jar>${project.basedir}/../order-service/target/order-service-${project.version}.jar</saga.e2e.order-jar>
                         <saga.e2e.payment-jar>${project.basedir}/../payment-service/target/payment-service-${project.version}.jar</saga.e2e.payment-jar>
                         <saga.e2e.inventory-jar>${project.basedir}/../inventory-service/target/inventory-service-${project.version}.jar</saga.e2e.inventory-jar>
+                        <saga.e2e.shipping-jar>${project.basedir}/../shipping-service/target/shipping-service-${project.version}.jar</saga.e2e.shipping-jar>
                         <saga.e2e.ui-jar>${project.basedir}/../saga-ui/target/saga-ui-${project.version}.jar</saga.e2e.ui-jar>
                         <saga.e2e.init-sql>${project.basedir}/../docker/postgres/init.sql</saga.e2e.init-sql>
                         <saga.e2e.realm-json>${project.basedir}/../docker/keycloak/saga-realm.json</saga.e2e.realm-json>

@@ -1,13 +1,15 @@
 'use strict';
 
 /*
- * Saga console. Talks to the services through the saga-ui proxy (/api/{order|payment|inventory}/...) and to
+ * Saga console. Talks to the services through the saga-ui proxy (/api/{order|payment|inventory|shipping}/...) and to
  * saga-ui itself for message injection (/api/inject). All server data is rendered via textContent / DOM nodes.
  */
 
-const SERVICES = ['order', 'payment', 'inventory'];
-const LANE = { order: 1, payment: 2, inventory: 3 };
-const TOPIC_TARGET = { 'payment.commands': 'payment', 'inventory.commands': 'inventory', 'order.saga.replies': 'order' };
+const SERVICES = ['order', 'payment', 'inventory', 'shipping'];
+const LANE = { order: 1, payment: 2, inventory: 3, shipping: 4 };
+const TOPIC_TARGET = {
+    'payment.commands': 'payment', 'inventory.commands': 'inventory', 'shipping.commands': 'shipping', 'order.saga.replies': 'order',
+};
 const POLL_MS = 1500;
 
 const state = {
@@ -163,14 +165,14 @@ function applyRoleGates() {
         }
     };
     gate(document.querySelectorAll('.scenario'), ROLE.admin);
-    gate(document.querySelectorAll('#customer-form button, #product-form button'), ROLE.admin);
+    gate(document.querySelectorAll('#customer-form button, #product-form button, #zone-form button'), ROLE.admin);
     gate(document.querySelectorAll('#intervene-form button'), ROLE.operator);
     gate(document.querySelectorAll('#inject-form button, #presets button'), ROLE.operator);
     const notes = [
         ['#scenario-roles', ROLE.admin, 'Scenarios create customers and products, which needs the saga-admin role. You can still place orders for existing customers below.'],
         ['#intervene-roles', ROLE.operator, 'Retry and resolve need the saga-operator role.'],
         ['#inject-roles', ROLE.operator, 'Publishing messages needs the saga-operator role.'],
-        ['#data-roles', ROLE.admin, 'Changing credit or stock needs the saga-admin role.'],
+        ['#data-roles', ROLE.admin, 'Changing credit, stock or shipping zones needs the saga-admin role.'],
     ];
     for (const [selector, role, text] of notes) {
         const el = $(selector);
@@ -233,9 +235,9 @@ function tick() {
 
 const SCENARIOS = [
     {
-        key: 'happy', kind: 'fwd', title: 'Happy path', expect: 'Charged, reserved, approved',
+        key: 'happy', kind: 'fwd', title: 'Happy path', expect: 'Charged, reserved, shipped, approved',
         credit: 500, stock: 10, quantity: 2, amount: 120, count: 1,
-        note: 'Payment is charged, stock is reserved and the order is approved.',
+        note: 'Payment is charged, stock is reserved, a shipment is scheduled and the order is approved.',
     },
     {
         key: 'credit', kind: 'fail', title: 'Insufficient credit', expect: 'Payment declined, order rejected',
@@ -246,6 +248,12 @@ const SCENARIOS = [
         key: 'stock', kind: 'comp', title: 'Out of stock', expect: 'Charged, then refunded, order rejected',
         credit: 500, stock: 0, quantity: 1, amount: 80, count: 1,
         note: 'The payment succeeds, inventory fails, so the saga compensates with a refund. Credit ends where it started.',
+    },
+    {
+        key: 'unshippable', kind: 'comp', title: 'Unshippable destination', expect: 'Charged, reserved, then both undone',
+        credit: 500, stock: 10, quantity: 1, amount: 60, count: 1, destination: 'XX',
+        note: 'Payment and stock succeed, but no carrier serves XX, so the saga undoes the earlier steps in reverse order: '
+            + 'it releases the stock, then refunds the payment. Credit and stock end where they started.',
     },
     {
         key: 'burst', kind: 'comp', title: 'Ten orders at once', expect: 'Five approved, five refunded',
@@ -275,7 +283,7 @@ async function runScenario(sc) {
         const product = await call('inventory', 'PUT', `/products/${productId}`, { availableQuantity: sc.stock });
         if (!product.ok) throw new Error(setupError('inventory', 'product', product));
 
-        const body = { customerId, productId, quantity: sc.quantity, amount: sc.amount };
+        const body = { customerId, productId, quantity: sc.quantity, amount: sc.amount, destination: sc.destination || 'GB' };
         const results = await Promise.all(Array.from({ length: sc.count }, () => call('order', 'POST', '/orders', body)));
         const placed = results.filter((r) => r.ok);
         if (placed.length === 0) throw new Error(`No order was placed: ${errorText(results[0])}`);
@@ -310,7 +318,7 @@ async function runScenario(sc) {
 }
 
 /*
- * The order form's suggestions come from payment- and inventory-service. They are remembered (also across a
+ * The order form's suggestions come from payment-, inventory- and shipping-service. They are remembered (also across a
  * reload), so the form keeps working while one of them is down - which is exactly when you want to place an
  * order and watch the saga time out and compensate. Ids can always be typed in.
  */
@@ -334,7 +342,8 @@ async function awaitOutcomes(orderIds, timeoutMs = 60000) {
 }
 
 async function loadOrderOptions() {
-    const [customers, products] = await Promise.all([get('payment', '/customers'), get('inventory', '/products')]);
+    const [customers, products, zones] = await Promise.all([
+        get('payment', '/customers'), get('inventory', '/products'), get('shipping', '/zones')]);
     const known = rememberedOptions();
     const notes = [];
     if (customers.ok) {
@@ -347,10 +356,16 @@ async function loadOrderOptions() {
     } else {
         notes.push(`inventory-service is unavailable, so the product suggestions are ${known.products ? 'from earlier' : 'empty'}`);
     }
+    if (zones.ok) {
+        known.zones = zones.data.map((z) => [z.country, `${z.name}${z.served ? '' : ', no carrier'}`]);
+    } else {
+        notes.push(`shipping-service is unavailable, so the destination suggestions are ${known.zones ? 'from earlier' : 'empty'}`);
+    }
     try { localStorage.setItem(OPTIONS_KEY, JSON.stringify(known)); } catch { /* storage unavailable */ }
 
     fillOptions($('#customer-options'), known.customers || []);
     fillOptions($('#product-options'), known.products || []);
+    fillOptions($('#destination-options'), known.zones || []);
     const form = $('#order-form');
     // Prefer the seed data over whatever scenario customer/product happens to sort first
     const pick = (list, preferred) => (list.some(([value]) => value === preferred) ? preferred : list[0][0]);
@@ -384,6 +399,7 @@ async function placeOrder(event) {
         productId: form.productId.value,
         quantity: Number(form.quantity.value),
         amount: Number(form.amount.value),
+        destination: form.destination.value.trim().toUpperCase() || 'GB',
     });
     if (!result.ok) {
         error.textContent = errorText(result);
@@ -409,7 +425,7 @@ async function refreshOrders() {
         h('button', { type: 'button', 'aria-current': String(o.id === state.orderId), onclick: () => selectOrder(o.id) },
             h('span', { class: 'oid', text: short(o.id) }),
             badge(o.status),
-            h('span', { class: 'meta', text: `${o.quantity} × ${o.productId} for ${money(o.amount)}, ${human(o.sagaState)}, ${ago(o.createdAt)}` })))));
+            h('span', { class: 'meta', text: `${o.quantity} × ${o.productId} to ${o.destination} for ${money(o.amount)}, ${human(o.sagaState)}, ${ago(o.createdAt)}` })))));
 }
 
 function selectOrder(orderId) {
@@ -436,12 +452,14 @@ async function refreshDetail() {
     const order = orderResult.data;
     state.sagaId = order.sagaId;
 
-    const [outOrder, outPayment, outInventory, payment, reservation, customer, product, saga] = await Promise.all([
+    const [outOrder, outPayment, outInventory, outShipping, payment, reservation, shipment, customer, product, saga] = await Promise.all([
         get('order', `/actuator/outbox/${id}`),
         get('payment', `/actuator/outbox/${id}`),
         get('inventory', `/actuator/outbox/${id}`),
+        get('shipping', `/actuator/outbox/${id}`),
         get('payment', `/payments/${id}`),
         get('inventory', `/reservations/${id}`),
+        get('shipping', `/shipments/${id}`),
         get('payment', `/customers/${encodeURIComponent(order.customerId)}`),
         get('inventory', `/products/${encodeURIComponent(order.productId)}`),
         get('order', `/actuator/stucksagas/${order.sagaId}`),
@@ -452,6 +470,7 @@ async function refreshDetail() {
         ...(outOrder.ok ? outOrder.data.map((m) => ({ ...m, service: 'order' })) : []),
         ...(outPayment.ok ? outPayment.data.map((m) => ({ ...m, service: 'payment' })) : []),
         ...(outInventory.ok ? outInventory.data.map((m) => ({ ...m, service: 'inventory' })) : []),
+        ...(outShipping.ok ? outShipping.data.map((m) => ({ ...m, service: 'shipping' })) : []),
     ].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     const sagaDetail = saga.ok ? saga.data : null;
 
@@ -461,12 +480,12 @@ async function refreshDetail() {
     renderMap(order, messages);
     renderTimeline(order, messages, sagaDetail);
     renderSaga(order, sagaDetail);
-    renderParticipants(order, payment, reservation, customer, product);
+    renderParticipants(order, payment, reservation, shipment, customer, product);
 }
 
 function renderHeader(order) {
     $('#d-title').textContent = `Order ${order.id}`;
-    $('#d-sub').textContent = `${order.customerId} buys ${order.quantity} × ${order.productId} for ${money(order.amount)}, placed ${ago(order.createdAt)}`;
+    $('#d-sub').textContent = `${order.customerId} buys ${order.quantity} × ${order.productId} for ${money(order.amount)}, shipping to ${order.destination}, placed ${ago(order.createdAt)}`;
     const status = $('#d-status');
     status.className = `badge ${order.status}`;
     status.textContent = human(order.status);
@@ -477,27 +496,35 @@ function renderHeader(order) {
 
 /* The state machine as a transit map: stations are saga states, lit tracks are the route this order took. */
 
+/* Forward steps run left to right along the top; compensations run back right to left along the bottom, so each
+   step's undo sits under it and every failure drops straight down or one column to the right. No track crosses another. */
 const STATIONS = {
-    PAYMENT_PENDING: { x: 110, y: 50, label: 'Payment pending' },
-    INVENTORY_PENDING: { x: 450, y: 50, label: 'Inventory pending' },
-    COMPLETED: { x: 790, y: 50, label: 'Completed' },
-    FAILED: { x: 110, y: 230, label: 'Failed' },
-    COMPENSATING: { x: 450, y: 230, label: 'Refunding payment' },
-    RELEASING_INVENTORY: { x: 790, y: 230, label: 'Releasing inventory' },
+    PAYMENT_PENDING: { x: 90, y: 50, label: 'Payment pending' },
+    INVENTORY_PENDING: { x: 360, y: 50, label: 'Inventory pending' },
+    SHIPPING_PENDING: { x: 630, y: 50, label: 'Shipping pending' },
+    COMPLETED: { x: 900, y: 50, label: 'Completed' },
+    FAILED: { x: 90, y: 230, label: 'Failed' },
+    COMPENSATING: { x: 360, y: 230, label: 'Refunding payment' },
+    RELEASING_INVENTORY: { x: 630, y: 230, label: 'Releasing inventory' },
+    CANCELLING_SHIPMENT: { x: 900, y: 230, label: 'Cancelling shipment' },
 };
-const NODE_W = 170;
+const NODE_W = 160;
 const NODE_H = 42;
 
-/* Label offsets are chosen so no two labels share space: verticals label outward, diagonals label away from them. */
+/* Labels: top row above its track, bottom row below its track, verticals and diagonals to their left. */
 const TRACKS = [
     { from: 'PAYMENT_PENDING', to: 'INVENTORY_PENDING', kind: 'fwd', label: 'PaymentProcessed', lx: 0, ly: -10 },
-    { from: 'INVENTORY_PENDING', to: 'COMPLETED', kind: 'fwd', label: 'InventoryReserved', lx: 0, ly: -10 },
+    { from: 'INVENTORY_PENDING', to: 'SHIPPING_PENDING', kind: 'fwd', label: 'InventoryReserved', lx: 0, ly: -10 },
+    { from: 'SHIPPING_PENDING', to: 'COMPLETED', kind: 'fwd', label: 'ShipmentScheduled', lx: 0, ly: -10 },
     { from: 'PAYMENT_PENDING', to: 'FAILED', kind: 'fwd', label: 'PaymentFailed', lx: -10, ly: 4, anchor: 'end' },
-    { from: 'PAYMENT_PENDING', to: 'COMPENSATING', kind: 'comp', label: 'payment timeout', lx: -14, ly: 4, anchor: 'end' },
-    { from: 'INVENTORY_PENDING', to: 'COMPENSATING', kind: 'comp', label: 'InventoryFailed', lx: 10, ly: 4, anchor: 'start' },
-    { from: 'INVENTORY_PENDING', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'inventory timeout', lx: 14, ly: 4, anchor: 'start' },
-    { from: 'RELEASING_INVENTORY', to: 'COMPENSATING', kind: 'comp', label: 'InventoryReleased', lx: 0, ly: -10 },
-    { from: 'COMPENSATING', to: 'FAILED', kind: 'comp', label: 'PaymentRefunded', lx: 0, ly: -10 },
+    { from: 'PAYMENT_PENDING', to: 'COMPENSATING', kind: 'comp', label: 'payment timeout', lx: -12, ly: 4, anchor: 'end' },
+    { from: 'INVENTORY_PENDING', to: 'COMPENSATING', kind: 'comp', label: 'InventoryFailed', lx: -10, ly: 4, anchor: 'end' },
+    { from: 'INVENTORY_PENDING', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'inventory timeout', lx: -12, ly: 4, anchor: 'end' },
+    { from: 'SHIPPING_PENDING', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'ShipmentFailed', lx: -10, ly: 4, anchor: 'end' },
+    { from: 'SHIPPING_PENDING', to: 'CANCELLING_SHIPMENT', kind: 'comp', label: 'shipping timeout', lx: -12, ly: 4, anchor: 'end' },
+    { from: 'CANCELLING_SHIPMENT', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'ShipmentCancelled', lx: 0, ly: 18 },
+    { from: 'RELEASING_INVENTORY', to: 'COMPENSATING', kind: 'comp', label: 'InventoryReleased', lx: 0, ly: 18 },
+    { from: 'COMPENSATING', to: 'FAILED', kind: 'comp', label: 'PaymentRefunded', lx: 0, ly: 18 },
 ];
 
 /** Replays the order's commands to reconstruct the states it passed through. */
@@ -507,7 +534,11 @@ function derivePath(order, messages) {
     for (const m of messages) {
         const current = route[route.length - 1];
         if (m.messageType === 'ReserveInventory' && current === 'PAYMENT_PENDING') move('INVENTORY_PENDING');
-        if (m.messageType === 'ReleaseInventory' && current === 'INVENTORY_PENDING') move('RELEASING_INVENTORY');
+        if (m.messageType === 'ScheduleShipment' && current === 'INVENTORY_PENDING') move('SHIPPING_PENDING');
+        if (m.messageType === 'CancelShipment' && current === 'SHIPPING_PENDING') move('CANCELLING_SHIPMENT');
+        if (m.messageType === 'ReleaseInventory' && ['INVENTORY_PENDING', 'SHIPPING_PENDING', 'CANCELLING_SHIPMENT'].includes(current)) {
+            move('RELEASING_INVENTORY');
+        }
         if (m.messageType === 'RefundPayment' && current !== 'COMPENSATING') move('COMPENSATING');
     }
     move(order.sagaState);
@@ -578,13 +609,14 @@ function edgePoint(station, dx, dy, gap) {
     return [station.x + dx * t + (dx / length) * gap, station.y + dy * t + (dy / length) * gap];
 }
 
-const COMPENSATION_TYPES = new Set(['RefundPayment', 'ReleaseInventory', 'PaymentRefunded', 'InventoryReleased']);
-const FAILURE_TYPES = new Set(['PaymentFailed', 'InventoryFailed']);
+const COMPENSATION_TYPES = new Set([
+    'RefundPayment', 'ReleaseInventory', 'CancelShipment', 'PaymentRefunded', 'InventoryReleased', 'ShipmentCancelled']);
+const FAILURE_TYPES = new Set(['PaymentFailed', 'InventoryFailed', 'ShipmentFailed']);
 
 function messageKind(type) {
     if (COMPENSATION_TYPES.has(type)) return 'comp';
     if (FAILURE_TYPES.has(type)) return 'fail';
-    if (type === 'InventoryReserved') return 'ok';
+    if (type === 'ShipmentScheduled') return 'ok';
     return '';
 }
 
@@ -622,7 +654,7 @@ function messageNode(m) {
 }
 
 function renderSaga(order, saga) {
-    const compensating = ['COMPENSATING', 'RELEASING_INVENTORY'].includes(order.sagaState);
+    const compensating = ['CANCELLING_SHIPMENT', 'RELEASING_INVENTORY', 'COMPENSATING'].includes(order.sagaState);
     let deadline = '–';
     if (saga && saga.deadline) {
         const seconds = (Date.parse(saga.deadline) - Date.now()) / 1000;
@@ -640,7 +672,7 @@ function renderSaga(order, saga) {
         `${human(i.action)} by ${i.operator}, ${ago(i.at)}${i.note ? `: ${i.note}` : ''}`)));
 }
 
-function renderParticipants(order, payment, reservation, customer, product) {
+function renderParticipants(order, payment, reservation, shipment, customer, product) {
     facts($('#payment-facts'), [
         ['Payment', payment.ok ? badge(payment.data.status) : (payment.status === 404 ? 'no charge recorded' : 'unavailable')],
         ['Amount', payment.ok && payment.data.amount !== null ? money(payment.data.amount) : '–'],
@@ -650,6 +682,11 @@ function renderParticipants(order, payment, reservation, customer, product) {
         ['Reservation', reservation.ok ? badge(reservation.data.status) : (reservation.status === 404 ? 'nothing reserved' : 'unavailable')],
         ['Quantity', reservation.ok ? String(reservation.data.quantity) : '–'],
         ['Stock now', product.ok ? String(product.data.availableQuantity) : 'unavailable'],
+    ]);
+    facts($('#shipping-facts'), [
+        ['Shipment', shipment.ok ? badge(shipment.data.status) : (shipment.status === 404 ? 'nothing scheduled' : 'unavailable')],
+        ['Destination', order.destination],
+        ['Tracking', shipment.ok && shipment.data.trackingNumber ? h('code', { text: shipment.data.trackingNumber }) : '–'],
     ]);
 }
 
@@ -813,11 +850,43 @@ async function inject(event) {
 /* ------------------------------------------------------------------ customers & products tab */
 
 async function refreshData() {
-    const [customers, products] = await Promise.all([get('payment', '/customers'), get('inventory', '/products')]);
+    const [customers, products, zones] = await Promise.all([
+        get('payment', '/customers'), get('inventory', '/products'), get('shipping', '/zones')]);
+    renderZones(zones);
     dataTable($('#customers'), customers, ['Customer', 'Credit'],
         (c) => [c.customerId, money(c.availableCredit)], (c) => fillForm('#customer-form', c.customerId, c.availableCredit));
     dataTable($('#products'), products, ['Product', 'Stock'],
         (p) => [p.productId, String(p.availableQuantity)], (p) => fillForm('#product-form', p.productId, p.availableQuantity));
+}
+
+/** Shipping zones: closing one makes every order to that country fail at the shipping step and compensate. */
+function renderZones(result) {
+    const table = $('#zones');
+    const head = h('tr', {}, ...['Country', 'Name', 'Carrier', ''].map((t) => h('th', { text: t })));
+    if (!result.ok) {
+        table.replaceChildren(head, h('tr', { class: 'emptyrow' }, h('td', { colspan: 4, text: `Unavailable: ${errorText(result)}` })));
+        return;
+    }
+    table.replaceChildren(head, ...result.data.map((z) => h('tr', {},
+        h('td', {}, h('code', { text: z.country })),
+        h('td', { text: z.name }),
+        h('td', {}, h('span', { class: `badge ${z.served ? 'SERVED' : 'UNSERVED'}`, text: z.served ? 'serves' : 'none' })),
+        h('td', {}, h('button', {
+            type: 'button', text: z.served ? 'Close' : 'Open', disabled: !can(ROLE.admin), title: can(ROLE.admin) ? null : needs(ROLE.admin),
+            onclick: () => saveZone(z.country, !z.served),
+        })))));
+}
+
+async function saveZone(country, served) {
+    const error = $('#zone-error');
+    error.textContent = '';
+    const result = await call('shipping', 'PUT', `/zones/${encodeURIComponent(country)}`, { served });
+    if (!result.ok) {
+        error.textContent = errorText(result);
+        return;
+    }
+    refreshData();
+    loadOrderOptions();
 }
 
 function dataTable(table, result, headers, cells, onPick) {
@@ -861,7 +930,7 @@ function saveData(service, collection, field, errorSelector) {
 
 const CATALOGUE = {
     order: [
-        ['POST', '/orders', 'Place an order', { customerId: 'customer-1', productId: 'product-1', quantity: 1, amount: 25.0 }],
+        ['POST', '/orders', 'Place an order', { customerId: 'customer-1', productId: 'product-1', quantity: 1, amount: 25.0, destination: 'GB' }],
         ['GET', '/orders?limit=10', 'Recent orders'],
         ['GET', '/orders/{orderId}', 'One order with its saga state'],
         ['GET', '/actuator/outbox/{orderId}', 'Commands sent for an order'],
@@ -896,13 +965,24 @@ const CATALOGUE = {
         ['POST', '/actuator/dlt/inventory.commands', 'Replay dead-lettered commands', { limit: 100 }],
         ['GET', '/actuator/health', 'Health'],
     ],
+    shipping: [
+        ['GET', '/zones', 'Shipping zones'],
+        ['PUT', '/zones/{country}', 'Open or close a zone', { served: false }],
+        ['GET', '/shipments/{orderId}', 'Shipment for an order'],
+        ['GET', '/actuator/outbox/{orderId}', 'Replies sent for an order'],
+        ['GET', '/actuator/dlt', 'Dead-letter topics'],
+        ['POST', '/actuator/dlt/shipping.commands', 'Replay dead-lettered commands', { limit: 100 }],
+        ['GET', '/actuator/health', 'Health'],
+    ],
     ui: [
         ['POST', '/api/inject', 'Publish a raw message', { topic: 'payment.commands', messageType: 'NoSuchCommand', payload: '{"foo":1}' }],
         ['GET', '/actuator/health', 'Console health'],
     ],
 };
 
-const SERVICE_LABEL = { order: 'order-service', payment: 'payment-service', inventory: 'inventory-service', ui: 'This console' };
+const SERVICE_LABEL = {
+    order: 'order-service', payment: 'payment-service', inventory: 'inventory-service', shipping: 'shipping-service', ui: 'This console',
+};
 
 function renderCatalogue() {
     const aside = $('#catalogue');
@@ -925,7 +1005,8 @@ function loadRequest(service, method, path, body) {
         .replace('{orderId}', state.orderId || '00000000-0000-0000-0000-000000000000')
         .replace('{sagaId}', state.sagaId || '00000000-0000-0000-0000-000000000000')
         .replace('{customerId}', 'customer-1')
-        .replace('{productId}', 'product-1');
+        .replace('{productId}', 'product-1')
+        .replace('{country}', 'XX');
     form.body.value = body ? JSON.stringify(body, null, 2) : '';
     form.path.focus();
 }

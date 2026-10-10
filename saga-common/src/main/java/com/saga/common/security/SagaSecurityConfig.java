@@ -12,7 +12,7 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 
 /**
- * The single access rulebook for order-, payment- and inventory-service: OAuth2 resource server validating
+ * The single access rulebook for order-, payment-, inventory- and shipping-service: OAuth2 resource server validating
  * Keycloak JWTs (issuer, signature, audience {@code saga-api}). Roles come from the token's {@code roles} claim,
  * mapped to {@code ROLE_*} by the {@code spring.security.oauth2.resourceserver.jwt.*} properties in each service.
  * <p>
@@ -21,9 +21,9 @@ import org.springframework.security.web.SecurityFilterChain;
  * <pre>
  * public          GET /actuator/health[/**], POST /orders, GET /orders/{id}, /error
  * metrics|viewer  GET /actuator/prometheus
- * viewer          GET /actuator/**, GET /orders (list), GET /customers|products|payments|reservations/**
+ * viewer          GET /actuator/**, GET /orders (list), GET /customers|products|payments|reservations|shipments|zones/**
  * operator        POST /actuator/dlt/**, POST /actuator/stucksagas/**
- * admin           PUT /customers/**, PUT /products/**
+ * admin           PUT /customers/**, PUT /products/**, PUT /zones/**
  * </pre>
  * Roles are composite in Keycloak (admin ⊃ operator ⊃ viewer), so higher roles pass lower checks.
  */
@@ -48,9 +48,10 @@ public class SagaSecurityConfig {
                         .requestMatchers("/error").permitAll()
                         .requestMatchers(GET, "/actuator/prometheus").hasAnyRole(METRICS, VIEWER)
                         .requestMatchers(GET, "/actuator/**", "/orders",
-                                "/customers/**", "/products/**", "/payments/**", "/reservations/**").hasRole(VIEWER)
+                                "/customers/**", "/products/**", "/payments/**", "/reservations/**",
+                                "/shipments/**", "/zones/**").hasRole(VIEWER)
                         .requestMatchers(POST, "/actuator/dlt/**", "/actuator/stucksagas/**").hasRole(OPERATOR)
-                        .requestMatchers(PUT, "/customers/**", "/products/**").hasRole(ADMIN)
+                        .requestMatchers(PUT, "/customers/**", "/products/**", "/zones/**").hasRole(ADMIN)
                         .anyRequest().denyAll())
                 .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));
         return http.build();

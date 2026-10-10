@@ -28,7 +28,8 @@ public interface OrderSagaRepository extends JpaRepository<OrderSaga, UUID> {
                 s.id, s.orderId, s.state, s.failureReason,
                 s.compensationResends, s.compensatingSince, s.deadline)
             from OrderSaga s
-            where s.state in (com.saga.order.saga.SagaState.RELEASING_INVENTORY, com.saga.order.saga.SagaState.COMPENSATING)
+            where s.state in (com.saga.order.saga.SagaState.CANCELLING_SHIPMENT, com.saga.order.saga.SagaState.RELEASING_INVENTORY,
+                              com.saga.order.saga.SagaState.COMPENSATING)
               and s.compensationResends >= :threshold
             order by s.compensatingSince
             """)
@@ -39,7 +40,7 @@ public interface OrderSagaRepository extends JpaRepository<OrderSaga, UUID> {
                    count(*) filter (where compensation_resends >= :threshold)            as stuck,
                    coalesce(extract(epoch from now() - min(compensating_since)), 0)::float8 as oldest_age_seconds
             from order_saga
-            where state in ('RELEASING_INVENTORY', 'COMPENSATING')
+            where state in ('CANCELLING_SHIPMENT', 'RELEASING_INVENTORY', 'COMPENSATING')
             """, nativeQuery = true)
     CompensationStats compensationStats(@Param("threshold") int threshold);
 

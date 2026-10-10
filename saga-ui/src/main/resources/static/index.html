@@ -16,7 +16,7 @@
     <nav class="tabs" role="tablist">
         <button role="tab" data-tab="saga" aria-selected="true">Saga</button>
         <button role="tab" data-tab="ops" aria-selected="false">Operations</button>
-        <button role="tab" data-tab="data" aria-selected="false">Customers &amp; products</button>
+        <button role="tab" data-tab="data" aria-selected="false">Reference data</button>
         <button role="tab" data-tab="console" aria-selected="false">API console</button>
     </nav>
     <div class="who" id="who" aria-label="Signed-in user"></div>
@@ -42,10 +42,12 @@
                     <label>Product <input name="productId" list="product-options" required autocomplete="off" spellcheck="false" placeholder="product-1"></label>
                     <datalist id="product-options"></datalist>
                     <p class="note" id="order-options-note" aria-live="polite"></p>
-                    <div class="row2">
+                    <div class="row3">
                         <label>Quantity <input name="quantity" type="number" min="1" value="1" required></label>
                         <label>Amount <input name="amount" type="number" min="0.01" step="0.01" value="25.00" required></label>
+                        <label>Ship to <input name="destination" list="destination-options" value="GB" required pattern="[A-Za-z]{2}" maxlength="2" autocomplete="off" spellcheck="false" title="Two-letter country code"></label>
                     </div>
+                    <datalist id="destination-options"></datalist>
                     <button type="submit" class="primary">Place order</button>
                     <p class="error" id="order-error" aria-live="polite"></p>
                 </form>
@@ -73,7 +75,7 @@
                 <p class="reason" id="d-reason" hidden></p>
 
                 <figure class="map">
-                    <svg id="map" viewBox="0 0 900 280" role="img" aria-labelledby="map-title">
+                    <svg id="map" viewBox="0 0 1000 280" role="img" aria-labelledby="map-title">
                         <title id="map-title">Saga state machine with the path this order took</title>
                     </svg>
                     <figcaption class="legend">
@@ -86,7 +88,7 @@
                 <div class="split">
                     <section>
                         <h3>Messages</h3>
-                        <div class="lanes-head"><span></span><span>order</span><span>payment</span><span>inventory</span></div>
+                        <div class="lanes-head"><span></span><span>order</span><span>payment</span><span>inventory</span><span>shipping</span></div>
                         <ol class="timeline" id="timeline"></ol>
                     </section>
                     <section class="side">
@@ -111,6 +113,8 @@
                         <dl class="facts" id="payment-facts"></dl>
                         <h3>Inventory</h3>
                         <dl class="facts" id="inventory-facts"></dl>
+                        <h3>Shipping</h3>
+                        <dl class="facts" id="shipping-facts"></dl>
                     </section>
                 </div>
             </div>
@@ -149,6 +153,7 @@
                             <select name="topic">
                                 <option>payment.commands</option>
                                 <option>inventory.commands</option>
+                                <option>shipping.commands</option>
                                 <option>order.saga.replies</option>
                             </select>
                         </label>
@@ -159,6 +164,8 @@
                         <option>ReserveInventory</option><option>ReleaseInventory</option>
                         <option>PaymentProcessed</option><option>PaymentFailed</option><option>PaymentRefunded</option>
                         <option>InventoryReserved</option><option>InventoryFailed</option><option>InventoryReleased</option>
+                        <option>ScheduleShipment</option><option>CancelShipment</option>
+                        <option>ShipmentScheduled</option><option>ShipmentFailed</option><option>ShipmentCancelled</option>
                     </datalist>
                     <div class="row3">
                         <label>Key <input name="key" placeholder="random"></label>
@@ -210,6 +217,12 @@
                 <table class="grid" id="products"></table>
             </section>
         </div>
+        <section class="block">
+            <h2>Shipping zones</h2>
+            <p class="hint">Countries a carrier delivers to. Close one and every order shipping there fails at the last step: the saga then releases the stock and refunds the payment.</p>
+            <p class="error" id="zone-error" aria-live="polite"></p>
+            <table class="grid" id="zones"></table>
+        </section>
     </section>
 
     <!-- API console --------------------------------------------------------------------------------->
@@ -223,6 +236,7 @@
                             <option value="order">order</option>
                             <option value="payment">payment</option>
                             <option value="inventory">inventory</option>
+                            <option value="shipping">shipping</option>
                             <option value="ui">console</option>
                         </select>
                         <select name="method" aria-label="Method">

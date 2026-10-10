@@ -13,6 +13,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 public record SagaTimeoutProperties(
         @DefaultValue("30s") Duration payment,
         @DefaultValue("30s") Duration inventory,
+        @DefaultValue("30s") Duration shipping,
         @DefaultValue("30s") Duration compensation,
         @DefaultValue("5s") Duration scanInterval,
         @DefaultValue("100") int batchSize) {

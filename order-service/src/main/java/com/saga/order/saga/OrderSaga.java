@@ -39,7 +39,7 @@ public class OrderSaga {
     @Column
     private Instant deadline;
 
-    /** When the saga first entered compensation (RELEASING_INVENTORY or COMPENSATING); null if it never did. */
+    /** When the saga first entered compensation (CANCELLING_SHIPMENT, RELEASING_INVENTORY or COMPENSATING); null if it never did. */
     @Column(name = "compensating_since")
     private Instant compensatingSince;
 
@@ -82,8 +82,8 @@ public class OrderSaga {
         this.failureReason = "Payment timed out";
     }
 
-    public void inventoryReserved() {
-        transition(SagaState.INVENTORY_PENDING, SagaState.COMPLETED, null);
+    public void inventoryReserved(Instant shippingDeadline) {
+        transition(SagaState.INVENTORY_PENDING, SagaState.SHIPPING_PENDING, shippingDeadline);
     }
 
     public void inventoryFailed(String reason, Instant compensationDeadline) {
@@ -94,6 +94,26 @@ public class OrderSaga {
     public void inventoryTimedOut(Instant compensationDeadline) {
         transition(SagaState.INVENTORY_PENDING, SagaState.RELEASING_INVENTORY, compensationDeadline);
         this.failureReason = "Inventory timed out";
+    }
+
+    /** The pivot succeeded: from here on the order stands and nothing is compensated. */
+    public void shipmentScheduled() {
+        transition(SagaState.SHIPPING_PENDING, SagaState.COMPLETED, null);
+    }
+
+    /** Shipping refused: undo the earlier steps in reverse order, starting with the reservation. */
+    public void shipmentFailed(String reason, Instant compensationDeadline) {
+        transition(SagaState.SHIPPING_PENDING, SagaState.RELEASING_INVENTORY, compensationDeadline);
+        this.failureReason = reason;
+    }
+
+    public void shippingTimedOut(Instant compensationDeadline) {
+        transition(SagaState.SHIPPING_PENDING, SagaState.CANCELLING_SHIPMENT, compensationDeadline);
+        this.failureReason = "Shipping timed out";
+    }
+
+    public void shipmentCancelled(Instant compensationDeadline) {
+        transition(SagaState.CANCELLING_SHIPMENT, SagaState.RELEASING_INVENTORY, compensationDeadline);
     }
 
     public void inventoryReleased(Instant compensationDeadline) {

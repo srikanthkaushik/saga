@@ -3,7 +3,11 @@ package com.saga.order.saga;
 public enum SagaState {
     PAYMENT_PENDING,
     INVENTORY_PENDING,
-    /** Inventory step timed out: releasing any reservation that may have been made, then refunding. */
+    /** The pivot step: a scheduled shipment completes the saga; a refused one is compensated. */
+    SHIPPING_PENDING,
+    /** Shipping step timed out: cancelling any shipment that may have been scheduled, then releasing, then refunding. */
+    CANCELLING_SHIPMENT,
+    /** Releasing the stock reservation (inventory timed out, or shipping failed), then refunding. */
     RELEASING_INVENTORY,
     /** Refunding the payment. */
     COMPENSATING,
@@ -15,6 +19,6 @@ public enum SagaState {
     }
 
     public boolean isCompensating() {
-        return this == RELEASING_INVENTORY || this == COMPENSATING;
+        return this == CANCELLING_SHIPMENT || this == RELEASING_INVENTORY || this == COMPENSATING;
     }
 }

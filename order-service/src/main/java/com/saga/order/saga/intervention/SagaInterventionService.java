@@ -53,7 +53,7 @@ public class SagaInterventionService {
 
     /**
      * @throws SagaNotFoundException      no such saga
-     * @throws SagaNotCompensatingException the saga is not in RELEASING_INVENTORY or COMPENSATING
+     * @throws SagaNotCompensatingException the saga is not in CANCELLING_SHIPMENT, RELEASING_INVENTORY or COMPENSATING
      */
     @Transactional
     public InterventionResult intervene(UUID sagaId, InterventionAction action, String operator, String note) {
@@ -90,7 +90,7 @@ public class SagaInterventionService {
 
     public static class SagaNotCompensatingException extends RuntimeException {
         SagaNotCompensatingException(OrderSaga saga) {
-            super("Saga " + saga.getId() + " is " + saga.getState() + "; only RELEASING_INVENTORY or COMPENSATING sagas can be retried or resolved");
+            super("Saga " + saga.getId() + " is " + saga.getState() + "; only CANCELLING_SHIPMENT, RELEASING_INVENTORY or COMPENSATING sagas can be retried or resolved");
         }
     }
 }

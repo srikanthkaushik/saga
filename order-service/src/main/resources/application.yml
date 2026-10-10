@@ -52,6 +52,7 @@ saga:
   timeout:
     payment: 30s
     inventory: 30s
+    shipping: 30s
     compensation: 30s
     scan-interval: 5s
     batch-size: 100

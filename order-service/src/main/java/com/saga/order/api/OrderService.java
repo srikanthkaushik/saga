@@ -43,7 +43,8 @@ public class OrderService {
     @Transactional
     public OrderResponse create(CreateOrderRequest request) {
         Order order = orderRepository.save(
-                new Order(request.customerId(), request.productId(), request.quantity(), request.amount()));
+                new Order(request.customerId(), request.productId(), request.quantity(), request.amount(),
+                        request.destination()));
         OrderSaga saga = sagaRepository.save(new OrderSaga(order.getId(), Instant.now().plus(timeouts.payment())));
         outbox.write(Topics.PAYMENT_COMMANDS, order.getId().toString(),
                 new ProcessPayment(saga.getId(), order.getId(), order.getCustomerId(), order.getAmount()));

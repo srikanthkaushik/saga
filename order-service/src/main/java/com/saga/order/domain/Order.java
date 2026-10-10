@@ -31,6 +31,10 @@ public class Order {
     @Column(nullable = false, precision = 19, scale = 2)
     private BigDecimal amount;
 
+    /** ISO 3166-1 alpha-2 country the order ships to. */
+    @Column(nullable = false, length = 2)
+    private String destination;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private OrderStatus status;
@@ -50,12 +54,13 @@ public class Order {
     protected Order() {
     }
 
-    public Order(String customerId, String productId, int quantity, BigDecimal amount) {
+    public Order(String customerId, String productId, int quantity, BigDecimal amount, String destination) {
         this.id = UUID.randomUUID();
         this.customerId = customerId;
         this.productId = productId;
         this.quantity = quantity;
         this.amount = amount;
+        this.destination = destination;
         this.status = OrderStatus.PENDING;
         this.createdAt = Instant.now();
         this.updatedAt = this.createdAt;
@@ -98,6 +103,10 @@ public class Order {
 
     public BigDecimal getAmount() {
         return amount;
+    }
+
+    public String getDestination() {
+        return destination;
     }
 
     public OrderStatus getStatus() {

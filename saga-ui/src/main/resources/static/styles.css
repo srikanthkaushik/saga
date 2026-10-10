@@ -136,6 +136,7 @@ main { padding: 1.25rem 1.5rem 3rem; }
 .form label { display: grid; gap: .2rem; font-size: .8rem; color: var(--muted); }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
 .row3 { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: .6rem; }
+#order-form .row3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
 input, select, textarea {
     font: inherit; font-size: .9rem; color: var(--ink);
@@ -161,9 +162,9 @@ button.danger { color: var(--fail); border-color: var(--fail); }
     font-size: .78rem; font-weight: 600; white-space: nowrap;
     background: var(--fwd-soft); color: var(--fwd);
 }
-.badge.APPROVED, .badge.COMPLETED, .badge.RESERVED { background: var(--ok-soft); color: var(--ok); }
-.badge.REJECTED, .badge.FAILED { background: var(--fail-soft); color: var(--fail); }
-.badge.COMPENSATING, .badge.RELEASING_INVENTORY, .badge.REFUNDED, .badge.RELEASED, .badge.CANCELLED { background: var(--comp-soft); color: var(--comp); }
+.badge.APPROVED, .badge.COMPLETED, .badge.RESERVED, .badge.SCHEDULED, .badge.SERVED { background: var(--ok-soft); color: var(--ok); }
+.badge.REJECTED, .badge.FAILED, .badge.UNSERVED { background: var(--fail-soft); color: var(--fail); }
+.badge.COMPENSATING, .badge.RELEASING_INVENTORY, .badge.CANCELLING_SHIPMENT, .badge.REFUNDED, .badge.RELEASED, .badge.CANCELLED { background: var(--comp-soft); color: var(--comp); }
 
 .grid { width: 100%; border-collapse: collapse; font-size: .88rem; }
 .grid th { text-align: left; font-weight: 500; color: var(--muted); padding: .35rem .5rem; border-bottom: 1px solid var(--line); }
@@ -247,8 +248,8 @@ button.danger { color: var(--fail); border-color: var(--fail); }
 .split { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 1rem; align-items: start; }
 .split > section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md); padding: 1rem; }
 
-/* Timeline as a sequence of messages across three lanes */
-.lanes-head, .timeline li { display: grid; grid-template-columns: 4.5rem repeat(3, minmax(0, 1fr)); gap: .5rem; }
+/* Timeline as a sequence of messages across one lane per service */
+.lanes-head, .timeline li { display: grid; grid-template-columns: 4.5rem repeat(4, minmax(0, 1fr)); gap: .5rem; }
 .lanes-head { font-size: .78rem; color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: .3rem; }
 .timeline { list-style: none; margin: 0; padding: 0; }
 .timeline li { padding: .35rem 0; border-bottom: 1px dashed var(--line); align-items: start; }
@@ -261,7 +262,7 @@ button.danger { color: var(--fail); border-color: var(--fail); }
 .msg summary { cursor: pointer; font-weight: 600; font-size: .85rem; list-style-position: inside; }
 .msg .to { display: block; color: var(--muted); font-size: .75rem; }
 .msg pre { margin: .3rem 0 .2rem; font-size: .72rem; white-space: pre-wrap; word-break: break-all; }
-.lane-1 { grid-column: 2; } .lane-2 { grid-column: 3; } .lane-3 { grid-column: 4; }
+.lane-1 { grid-column: 2; } .lane-2 { grid-column: 3; } .lane-3 { grid-column: 4; } .lane-4 { grid-column: 5; }
 .timeline .emptyrow { display: block; color: var(--muted); font-size: .85rem; padding: .75rem 0; border: 0; }
 
 .facts { display: grid; grid-template-columns: auto 1fr; gap: .25rem .75rem; margin: 0; font-size: .86rem; }

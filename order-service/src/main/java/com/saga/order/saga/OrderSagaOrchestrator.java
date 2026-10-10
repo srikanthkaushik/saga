@@ -17,9 +17,11 @@ import com.saga.common.idempotency.IdempotencyGuard;
 import com.saga.common.messaging.InboundMessage;
 import com.saga.common.messaging.MessageCodec;
 import com.saga.common.messaging.NonRetryableMessageException;
+import com.saga.common.messaging.SagaCommand.CancelShipment;
 import com.saga.common.messaging.SagaCommand.RefundPayment;
 import com.saga.common.messaging.SagaCommand.ReleaseInventory;
 import com.saga.common.messaging.SagaCommand.ReserveInventory;
+import com.saga.common.messaging.SagaCommand.ScheduleShipment;
 import com.saga.common.messaging.SagaReply;
 import com.saga.common.messaging.SagaReply.InventoryFailed;
 import com.saga.common.messaging.SagaReply.InventoryReleased;
@@ -27,6 +29,9 @@ import com.saga.common.messaging.SagaReply.InventoryReserved;
 import com.saga.common.messaging.SagaReply.PaymentFailed;
 import com.saga.common.messaging.SagaReply.PaymentProcessed;
 import com.saga.common.messaging.SagaReply.PaymentRefunded;
+import com.saga.common.messaging.SagaReply.ShipmentCancelled;
+import com.saga.common.messaging.SagaReply.ShipmentFailed;
+import com.saga.common.messaging.SagaReply.ShipmentScheduled;
 import com.saga.common.messaging.Topics;
 import com.saga.common.outbox.OutboxWriter;
 import com.saga.order.domain.Order;
@@ -35,12 +40,15 @@ import com.saga.order.domain.OrderRepository;
 /**
  * Drives the order saga:
  * <pre>
- * PAYMENT_PENDING --PaymentProcessed--> INVENTORY_PENDING --InventoryReserved--> COMPLETED
- *       |  PaymentFailed -> FAILED            |  InventoryFailed -> COMPENSATING
- *       |  timeout -> COMPENSATING            |  timeout -> RELEASING_INVENTORY --InventoryReleased--> COMPENSATING
- * COMPENSATING --PaymentRefunded--> FAILED
- * RELEASING_INVENTORY / COMPENSATING timeout -> re-send the compensation command, wait again
+ * PAYMENT_PENDING --PaymentProcessed--> INVENTORY_PENDING --InventoryReserved--> SHIPPING_PENDING --ShipmentScheduled--> COMPLETED
+ *   | PaymentFailed -> FAILED               | InventoryFailed -> COMPENSATING        | ShipmentFailed -> RELEASING_INVENTORY
+ *   | timeout -> COMPENSATING               | timeout -> RELEASING_INVENTORY         | timeout -> CANCELLING_SHIPMENT
+ * CANCELLING_SHIPMENT --ShipmentCancelled--> RELEASING_INVENTORY --InventoryReleased--> COMPENSATING --PaymentRefunded--> FAILED
+ * any compensating state on timeout -> re-send its compensation command, wait again
  * </pre>
+ * Shipping is the pivot: compensatable steps (payment, inventory) come before it and are undone in reverse order
+ * when it fails; once a shipment is scheduled the saga completes and nothing is compensated.
+ * <p>
  * Each reply or timeout is handled in one DB transaction covering the state change and the next command
  * (via the outbox). Timeouts compensate unconditionally: a slow participant's late charge or reservation is
  * undone because the compensation command shares its key (orderId) and therefore its partition, so it is
@@ -110,12 +118,24 @@ public class OrderSagaOrchestrator {
                 order.reject(f.reason());
             }
             case InventoryReserved r -> {
-                saga.inventoryReserved();
-                order.approve();
+                saga.inventoryReserved(now.plus(timeouts.shipping()));
+                sendScheduleShipment(saga, order);
             }
             case InventoryFailed f -> {
                 saga.inventoryFailed(f.reason(), now.plus(timeouts.compensation()));
                 sendRefundPayment(saga, order);
+            }
+            case ShipmentScheduled s -> {
+                saga.shipmentScheduled();
+                order.approve();
+            }
+            case ShipmentFailed f -> {
+                saga.shipmentFailed(f.reason(), now.plus(timeouts.compensation()));
+                sendReleaseInventory(saga, order);
+            }
+            case ShipmentCancelled c -> {
+                saga.shipmentCancelled(now.plus(timeouts.compensation()));
+                sendReleaseInventory(saga, order);
             }
             case InventoryReleased r -> {
                 saga.inventoryReleased(now.plus(timeouts.compensation()));
@@ -150,7 +170,11 @@ public class OrderSagaOrchestrator {
                 saga.inventoryTimedOut(compensationDeadline);
                 sendReleaseInventory(saga, order);
             }
-            case RELEASING_INVENTORY, COMPENSATING -> {
+            case SHIPPING_PENDING -> {
+                saga.shippingTimedOut(compensationDeadline);
+                sendCancelShipment(saga, order);
+            }
+            case CANCELLING_SHIPMENT, RELEASING_INVENTORY, COMPENSATING -> {
                 reportAfterCommit(saga, saga.resendCompensation(compensationDeadline));
                 sendCompensation(saga, order);
             }
@@ -171,9 +195,10 @@ public class OrderSagaOrchestrator {
         });
     }
 
-    /** Sends the command for the saga's current compensation step (release inventory, or refund payment). */
+    /** Sends the command for the saga's current compensation step (cancel shipment, release inventory, or refund payment). */
     public void sendCompensation(OrderSaga saga, Order order) {
         switch (saga.getState()) {
+            case CANCELLING_SHIPMENT -> sendCancelShipment(saga, order);
             case RELEASING_INVENTORY -> sendReleaseInventory(saga, order);
             case COMPENSATING -> sendRefundPayment(saga, order);
             default -> throw new IllegalStateException("Saga " + saga.getId() + " in " + saga.getState() + " is not compensating");
@@ -195,6 +220,15 @@ public class OrderSagaOrchestrator {
                 new ReleaseInventory(saga.getId(), order.getId(), order.getProductId(), order.getQuantity()));
     }
 
+    private void sendScheduleShipment(OrderSaga saga, Order order) {
+        outbox.write(Topics.SHIPPING_COMMANDS, order.getId().toString(), new ScheduleShipment(saga.getId(), order.getId(),
+                order.getProductId(), order.getQuantity(), order.getDestination()));
+    }
+
+    private void sendCancelShipment(OrderSaga saga, Order order) {
+        outbox.write(Topics.SHIPPING_COMMANDS, order.getId().toString(), new CancelShipment(saga.getId(), order.getId()));
+    }
+
     private void sendRefundPayment(OrderSaga saga, Order order) {
         outbox.write(Topics.PAYMENT_COMMANDS, order.getId().toString(), new RefundPayment(saga.getId(), order.getId()));
     }
@@ -205,6 +239,9 @@ public class OrderSagaOrchestrator {
             case PaymentFailed f -> SagaState.PAYMENT_PENDING;
             case InventoryReserved r -> SagaState.INVENTORY_PENDING;
             case InventoryFailed f -> SagaState.INVENTORY_PENDING;
+            case ShipmentScheduled s -> SagaState.SHIPPING_PENDING;
+            case ShipmentFailed f -> SagaState.SHIPPING_PENDING;
+            case ShipmentCancelled c -> SagaState.CANCELLING_SHIPMENT;
             case InventoryReleased r -> SagaState.RELEASING_INVENTORY;
             case PaymentRefunded r -> SagaState.COMPENSATING;
         };
