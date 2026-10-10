@@ -20,9 +20,11 @@ flowchart LR
     order[order-service] --> common
     payment[payment-service] --> common
     inventory[inventory-service] --> common
+    shipping[shipping-service] --> common
+    notification[notification-service] --> common
     ui["saga-ui<br/>(no saga-common)"]
     e2e["saga-e2e<br/>(tests only)"] -.->|launches the built jars| order
-    e2e -.-> payment & inventory & ui
+    e2e -.-> payment & inventory & shipping & notification & ui
 ```
 
 | Module | Packaging | Depends on | Key dependencies |
@@ -31,34 +33,36 @@ flowchart LR
 | `order-service` | Boot jar | saga-common | webmvc, validation, actuator, flyway, postgresql, micrometer-registry-prometheus |
 | `payment-service` | Boot jar | saga-common | webmvc, validation, actuator, flyway, postgresql |
 | `inventory-service` | Boot jar | saga-common | same as payment |
+| `shipping-service` | Boot jar | saga-common | same as payment |
+| `notification-service` | Boot jar | saga-common | same as payment |
 | `saga-ui` | Boot jar | – | webmvc, kafka, actuator, security, oauth2-client (no database) |
-| `saga-e2e` | test only | the four jars (for build order) | testcontainers-postgresql/-kafka, kafka-clients, jackson, awaitility |
+| `saga-e2e` | test only | the six jars (for build order) | testcontainers-postgresql/-kafka, kafka-clients, jackson, awaitility |
 
-All six modules inherit from the root [`pom.xml`](../pom.xml) (`saga-parent`, itself a child of `spring-boot-starter-parent` 4.0.6, Java 21). Versions come from Boot's dependency management; no module pins its own.
+All eight modules inherit from the root [`pom.xml`](../pom.xml) (`saga-parent`, itself a child of `spring-boot-starter-parent` 4.0.6, Java 21). Versions come from Boot's dependency management; no module pins its own.
 
 ---
 
 ## 2. Package layout and the `com.saga` root
 
-Every service's main class sits in the **root package `com.saga`**: `com.saga.OrderServiceApplication`, `com.saga.PaymentServiceApplication`, `com.saga.InventoryServiceApplication`. The shared library lives under `com.saga.common`. Spring Boot scans components, JPA entities and repositories from the main class's package downward, so each service automatically picks up `saga-common`'s outbox, idempotency, Kafka config and endpoints, with no `@EntityScan` or `scanBasePackages`.
+Every service's main class sits in the **root package `com.saga`**: `com.saga.OrderServiceApplication`, `com.saga.PaymentServiceApplication`, `com.saga.InventoryServiceApplication`, `com.saga.ShippingServiceApplication`, `com.saga.NotificationServiceApplication`. The shared library lives under `com.saga.common`. Spring Boot scans components, JPA entities and repositories from the main class's package downward, so each service automatically picks up `saga-common`'s outbox, idempotency, Kafka config and endpoints, with no `@EntityScan` or `scanBasePackages`.
 
 **Consequence:** two services can't run in one JVM (each would scan the other's beans). That's why the e2e tests launch real processes ([section 5](#5-the-tests)).
 
 ```
 com.saga
-├── OrderServiceApplication / PaymentServiceApplication / InventoryServiceApplication
+├── OrderServiceApplication / PaymentServiceApplication / InventoryServiceApplication / Shipping… / Notification…
 ├── common                      (saga-common)
-│   ├── messaging               message records, codec, topics, NonRetryableMessageException
+│   ├── messaging               commands, replies, order events, codec, topics, NonRetryableMessageException
 │   ├── outbox                  OutboxMessage, OutboxWriter, OutboxRelay, OutboxEndpoint
 │   ├── idempotency             ProcessedMessage, IdempotencyGuard
-│   ├── security                SagaSecurityConfig (the access rulebook for all three services)
+│   ├── security                SagaSecurityConfig (the access rulebook for all five services)
 │   ├── kafka                   KafkaErrorHandlingConfig (retry/DLT), RetryProperties
 │   │   └── dlt                 DltEndpoint, DltReplayer
 │   └── SagaCommonConfig        @EnableScheduling + topic creation
 ├── order                       (order-service)
 │   ├── api                     OrderController, OrderService, request/response records
 │   ├── domain                  Order entity
-│   └── saga                    OrderSaga, orchestrator, timeouts, alerting, stuck endpoint
+│   └── saga                    OrderSaga, orchestrator, event publisher, timeouts, alerting, stuck endpoint
 │       └── intervention        retry/resolve service + audit entity
 ├── payment                     (payment-service)
 │   ├── PaymentCommandHandler
@@ -68,6 +72,14 @@ com.saga
 │   ├── InventoryCommandHandler
 │   ├── api                     ProductController, ReservationController
 │   └── domain                  Product, Reservation
+├── shipping                    (shipping-service)
+│   ├── ShippingCommandHandler
+│   ├── api                     ShipmentController, ZoneController
+│   └── domain                  Shipment, ShippingZone
+├── notification                (notification-service)
+│   ├── NotificationHandler, NotificationProvider, NotificationProviderEndpoint
+│   ├── api                     NotificationController
+│   └── domain                  Notification
 └── ui                          (saga-ui) SagaUiApplication, ProxyController, InjectController,
                                 UiSecurityConfig, MeController
 ```
@@ -111,7 +123,12 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
    - **state guard:** `expectedState(reply)` must equal the saga's state, otherwise the reply is logged and ignored;
    - `switch (reply)` → `case PaymentProcessed` → `saga.paymentCompleted(now + inventory timeout)` and `sendReserveInventory`.
 9. inventory-service: [`InventoryCommandHandler.reserve`](../inventory-service/src/main/java/com/saga/inventory/InventoryCommandHandler.java) does the same pattern (lock the product, decrement, save a `Reservation`, reply `InventoryReserved`).
-10. order-service: `onReply` → `case InventoryReserved` → `saga.inventoryReserved()` (COMPLETED, deadline cleared) and `order.approve()`.
+10. order-service: `onReply` → `case InventoryReserved` → `saga.inventoryReserved(now + shipping timeout)` and `sendScheduleShipment`.
+11. shipping-service: [`ShippingCommandHandler.schedule`](../shipping-service/src/main/java/com/saga/shipping/ShippingCommandHandler.java): look for a fence, check the destination's `ShippingZone` is served, save a `Shipment` with a tracking number, reply `ShipmentScheduled`.
+12. order-service: `onReply` → `case ShipmentScheduled` → `saga.shipmentScheduled()` (COMPLETED, deadline cleared) and [`OrderEventPublisher.approve`](../order-service/src/main/java/com/saga/order/saga/OrderEventPublisher.java): `order.approve()` plus an `OrderApproved` outbox row on `order.events`, same transaction.
+
+**notification-service: tell the customer** (nobody waits for this)
+13. [`NotificationHandler.onEvent`](../notification-service/src/main/java/com/saga/notification/NotificationHandler.java) (`@KafkaListener(topics = order.events)`, `@Transactional`): decode, idempotency, skip if this order was already notified of this outcome, `NotificationProvider.send` (throws while the provider is down, so the error handler retries and dead-letters), then save the `Notification`.
 
 **When things go wrong** (the same classes, other branches):
 
@@ -130,7 +147,8 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 ### saga-common
 | Class | Responsibility |
 |---|---|
-| `messaging/SagaCommand`, `SagaReply` | Sealed interfaces holding every message record. **The message contract** |
+| `messaging/SagaCommand`, `SagaReply` | Sealed interfaces holding every command and reply record. **The saga's message contract** |
+| `messaging/OrderEvent` | Sealed interface for the domain events `OrderApproved` / `OrderRejected` on `order.events` |
 | `messaging/MessageCodec` | JSON serialization. The type registry is built from the sealed permits. Decodes `ConsumerRecord` → `InboundMessage` and throws `NonRetryableMessageException` for malformed input |
 | `messaging/Topics` | Topic names, header names, `dlt(topic)` |
 | `outbox/OutboxWriter` | Insert an outgoing message in the caller's transaction (MANDATORY) |
@@ -140,7 +158,7 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 | `kafka/KafkaErrorHandlingConfig` | `DefaultErrorHandler` + exponential backoff + DLT + not-retryable exceptions + retry logging |
 | `kafka/RetryProperties` | `saga.kafka.retry.*` |
 | `kafka/dlt/DltEndpoint`, `DltReplayer` | Actuator `dlt`: pending counts and replay, scoped to this service's listeners |
-| `SagaCommonConfig` | `@EnableScheduling`; declares the 3 topics + 3 DLTs (3 partitions, DLT retention 14 days) |
+| `SagaCommonConfig` | `@EnableScheduling`; declares the 5 topics + 5 DLTs (3 partitions, DLT retention 14 days) |
 | `security/SagaSecurityConfig` | OAuth2 resource-server `SecurityFilterChain`: who may call which method + path (public / viewer / operator / admin / metrics), stateless, deny by default |
 
 ### order-service
@@ -148,9 +166,10 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 |---|---|
 | `api/OrderController`, `OrderService` | `POST /orders`, `GET /orders`, `GET /orders/{id}`; creates the order, saga and first command in one transaction |
 | `domain/Order` | Order entity: `approve()`, `reject(reason)`, `@Version` |
-| `saga/SagaState` | The six states; `isTerminal()`, `isCompensating()` |
+| `saga/SagaState` | The eight states; `isTerminal()`, `isCompensating()` (CANCELLING_SHIPMENT, RELEASING_INVENTORY, COMPENSATING) |
 | `saga/OrderSaga` | Saga entity: guarded transition methods, deadline, compensation tracking, `@Version` |
 | `saga/OrderSagaOrchestrator` | **The state machine.** `onReply` (Kafka), `onTimeout` (scanner), `sendCompensation` |
+| `saga/OrderEventPublisher` | Approves or rejects the order and writes `OrderApproved`/`OrderRejected` to the outbox. Every terminal path goes through it |
 | `saga/SagaTimeoutScanner` + `SagaTimeoutProperties` | Times out overdue sagas (`saga.timeout.*`) |
 | `saga/CompensationMonitor` + `SagaAlertProperties` | Stuck threshold, the log line, Micrometer gauges and counter (`saga.alert.*`) |
 | `saga/StuckSagasEndpoint` | Actuator `stucksagas`: list, detail, retry/resolve |
@@ -167,15 +186,25 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 | `domain/Product`, `Reservation`, `ReservationStatus` | Stock with `reserve`/`release`; `Reservation.tombstone(...)` |
 | `api/ProductController`, `ReservationController` | Read APIs and the stock seed `PUT` |
 
+### shipping-service / notification-service
+| Class | Responsibility |
+|---|---|
+| `ShippingCommandHandler` | `schedule` (refuses unserved destinations and cancelled orders) and `cancel` (idempotent; leaves a CANCELLED tombstone) |
+| `domain/Shipment`, `ShippingZone` | Shipment SCHEDULED/CANCELLED with tracking number, `Shipment.tombstone(orderId)`; zone served or not |
+| `api/ShipmentController`, `ZoneController` | `GET /shipments/{orderId}`, `GET /zones`, and the admin `PUT /zones/{country}` |
+| `NotificationHandler` | Consumes `order.events`; one notification per order outcome |
+| `NotificationProvider`, `NotificationProviderEndpoint` | The simulated e-mail gateway and its actuator switch (`notificationprovider`) |
+| `api/NotificationController` | `GET /notifications?orderId=` |
+
 ### saga-ui
 | File | Responsibility |
 |---|---|
-| `ProxyController` | `/api/{order\|payment\|inventory}/**` pass-through via `RestClient.exchange`, adding the signed-in user's access token (from `OAuth2AuthorizedClientManager`, which refreshes it); 502 JSON when a service is unreachable |
+| `ProxyController` | `/api/{order\|payment\|inventory\|shipping\|notification}/**` pass-through via `RestClient.exchange`, adding the signed-in user's access token (from `OAuth2AuthorizedClientManager`, which refreshes it); 502 JSON when a service is unreachable |
 | `UiSecurityConfig` | OIDC login (`oauth2Login`), Keycloak logout, `csrf.spa()`, 401-with-marker-header for `/api/**`, `saga-operator` for `/api/inject`, maps the ID token's `roles` claim to `ROLE_*` |
 | `MeController` | `GET /api/me`: username, name and saga roles of the signed-in user (read from the authentication, where the mapped roles live) |
-| `InjectController` | `POST /api/inject`: raw records to the 3 saga topics in the services' wire format |
+| `InjectController` | `POST /api/inject`: raw records to the saga topics in the services' wire format |
 | `UiProperties` | `saga.ui.services.*` base URLs |
-| `static/index.html`, `styles.css`, `app.js` | The page. Vanilla JS, no build step. `derivePath` reconstructs the route from the timeline; `renderMap` draws the transit-map SVG; `refreshDetail` merges the three outboxes into the timeline |
+| `static/index.html`, `styles.css`, `app.js` | The page. Vanilla JS, no build step. `derivePath` reconstructs the route from the timeline; `renderMap` draws the transit-map SVG; `refreshDetail` merges the four outboxes and the notifications into the timeline |
 
 ### Configuration and ops
 | Path | Contents |
@@ -185,7 +214,7 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 | `docker-compose.yml`, `docker/postgres/init.sql` | Local development infrastructure: Postgres, Kafka, AKHQ, Keycloak |
 | `docker/keycloak/saga-realm.json` | The `saga` realm (roles, clients, dev users). `${VAR:default}` placeholders let a deployment set the console URL, secrets and passwords |
 | `docker/app.Dockerfile`, `docker/keycloak/Dockerfile`, `docker/postgres/Dockerfile`, `.dockerignore` | Container images: one layered, non-root image per Spring Boot module; Keycloak with the realm baked in; Postgres with the init script |
-| `ops/images.cmd` | Package + build the six images, optionally push (`SAGA_REGISTRY`, default `ghcr.io/srikanthkaushik`) |
+| `ops/images.cmd` | Package + build the eight images, optionally push (`SAGA_REGISTRY`, default `ghcr.io/srikanthkaushik`) |
 | `ops/prometheus/saga-alerts.yml`, `saga-alerts.test.yml` | Alert rules and their promtool tests |
 | `ops/RUNBOOK.md` | Operator procedures |
 
@@ -197,7 +226,7 @@ Everything is tested end-to-end in **`saga-e2e`**. There are no per-service unit
 
 | File | Role |
 |---|---|
-| [`SagaEndToEndIT`](../saga-e2e/src/test/java/com/saga/e2e/SagaEndToEndIT.java) | 23 tests (mapped to scenarios in [SCENARIOS.md › Scenario 14](SCENARIOS.md#scenario-14--the-automated-suite)) |
+| [`SagaEndToEndIT`](../saga-e2e/src/test/java/com/saga/e2e/SagaEndToEndIT.java) | 33 tests (mapped to scenarios in [SCENARIOS.md › Scenario 14](SCENARIOS.md#scenario-14--the-automated-suite)) |
 | [`ServiceProcess`](../saga-e2e/src/test/java/com/saga/e2e/ServiceProcess.java) | Starts a jar as a child JVM on a free port with `--property=value` overrides, waits for `/actuator/health`, logs to `target/e2e-logs/<name>.log` |
 | [`KafkaProbe`](../saga-e2e/src/test/java/com/saga/e2e/KafkaProbe.java) | Sends raw records (any headers, any partition) and waits for a given `messageId` on a DLT |
 | [`KeycloakSupport`](../saga-e2e/src/test/java/com/saga/e2e/KeycloakSupport.java) | Keycloak Testcontainer with the same realm file as docker-compose; tokens per dev user (cached a minute), client-credentials and wrong-realm tokens; points the console client's redirect URI at the console's random port |
@@ -205,7 +234,7 @@ Everything is tested end-to-end in **`saga-e2e`**. There are no per-service unit
 
 How the suite works:
 - `@Testcontainers` starts Postgres 17 (with `docker/postgres/init.sql`) and `apache/kafka:4.0.0`.
-- `@BeforeAll` launches order, payment, inventory and the console, pointed at those containers with fast settings.
+- `@BeforeAll` launches order, payment, inventory, shipping, notification and the console, pointed at those containers with fast settings.
 - **Isolation:** each test seeds its own customer and product with UUID ids over JDBC.
 - **Fault injection:**
   - poison records on every partition (to stall a participant past a timeout);
@@ -218,18 +247,24 @@ Run it with `mvn clean verify`. The promtool tests for the alert rules are separ
 
 ## 6. How to extend
 
-### Add a saga step (e.g. a shipping service)
-1. **Contract** ([`SagaCommand`](../saga-common/src/main/java/com/saga/common/messaging/SagaCommand.java) / [`SagaReply`](../saga-common/src/main/java/com/saga/common/messaging/SagaReply.java)): add records such as `ScheduleShipment` and `CancelShipment`, plus the replies `ShipmentScheduled`, `ShipmentFailed` and `ShipmentCancelled`. Add them to the `permits` list. `MessageCodec` registers them automatically.
-2. **Topic:** add `SHIPPING_COMMANDS` to [`Topics`](../saga-common/src/main/java/com/saga/common/messaging/Topics.java) and to `Topics.ALL`. `SagaCommonConfig` then creates the topic and its DLT.
-3. **Compile.** The exhaustive `switch (reply)` and `expectedState` in `OrderSagaOrchestrator` now fail to compile until the new replies are handled. That's deliberate.
-4. **States:** add the new states to `SagaState` (and to `isCompensating()` if it's a compensating state). Add guarded transition methods to `OrderSaga`, cases in `onTimeout`, and a `saga.timeout.shipping` property.
-5. **The participant:** a new module modeled on payment-service, with:
+### Add a saga step
+shipping-service was added exactly this way; its commit ("Add shipping-service: …") is a worked example.
+1. **Decide its kind:** compensatable (can be undone), pivot (point of no return) or retriable (after the pivot, never fails the order). Compensatable steps go before the pivot; retriable work usually belongs in an event subscriber instead (next section).
+2. **Contract** ([`SagaCommand`](../saga-common/src/main/java/com/saga/common/messaging/SagaCommand.java) / [`SagaReply`](../saga-common/src/main/java/com/saga/common/messaging/SagaReply.java)): add records such as `ScheduleShipment` and `CancelShipment`, plus the replies `ShipmentScheduled`, `ShipmentFailed` and `ShipmentCancelled`. Add them to the `permits` list. `MessageCodec` registers them automatically.
+3. **Topic:** add `SHIPPING_COMMANDS` to [`Topics`](../saga-common/src/main/java/com/saga/common/messaging/Topics.java) and to `Topics.ALL`. `SagaCommonConfig` then creates the topic and its DLT.
+4. **Compile.** The exhaustive `switch (reply)` and `expectedState` in `OrderSagaOrchestrator` now fail to compile until the new replies are handled. That's deliberate.
+5. **States:** add the new states to `SagaState` (and to `isCompensating()` if it's a compensating state). Add guarded transition methods to `OrderSaga`, cases in `onTimeout` and `sendCompensation`, and a `saga.timeout.shipping` property. Compensating states also appear in hard-coded SQL: `OrderSagaRepository.findStuck` / `compensationStats` and the partial index (see `V6__shipping_step.sql`).
+6. **The participant:** a new module modeled on payment-service, with:
    - main class in `com.saga`;
    - `@KafkaListener` + `@Transactional` + `IdempotencyGuard.firstDelivery` + `OutboxWriter`;
    - a business-key unique constraint on `order_id`;
    - an idempotent compensation that writes a tombstone when there's nothing to undo;
    - Flyway `V1__init.sql` including `outbox` and `processed_message`.
-6. **Tests:** add the e2e cases. If you want the console to show it, add a station and tracks to `STATIONS`/`TRACKS` in `app.js`.
+7. **Wiring:** root `pom.xml` module, `docker/postgres/init.sql` database, `ops/images.cmd`, `SagaSecurityConfig` rules for its APIs, console proxy (`UiProperties`, `ProxyController`).
+8. **Tests and console:** add the e2e cases. In `app.js`: `SERVICES`, `LANE`, `TOPIC_TARGET`, stations and tracks in `STATIONS`/`TRACKS`, `derivePath`.
+
+### Add an event subscriber
+notification-service is the example. Subscribe to `Topics.ORDER_EVENTS` with `@KafkaListener` under the service's own group id, decode with `MessageCodec`, guard with `IdempotencyGuard` and a business-key check, and let failures throw so the shared error handler retries and dead-letters them. order-service needs no change: it doesn't know its subscribers. Include the `outbox` table in the service's schema even if it emits nothing (the shared relay and entity expect it).
 
 ### Protect a new endpoint
 Add its method and path to the rulebook in [`SagaSecurityConfig`](../saga-common/src/main/java/com/saga/common/security/SagaSecurityConfig.java), at the right role, before `anyRequest().denyAll()`. Until you do, it is denied (403), which is the safe default. If it needs a new role:

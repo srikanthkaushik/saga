@@ -2,7 +2,9 @@
 
 > New here? Start with the [README](README.md) and the guides in [`docs/`](docs/): [Getting started](docs/GETTING-STARTED.md), [Architecture](docs/ARCHITECTURE.md), [Scenarios](docs/SCENARIOS.md), [Codebase tour](docs/CODEBASE.md). This file is the status and decision log.
 
-Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQL 17, Kafka 4.0 (KRaft), multi-module Maven.
+Order saga using orchestration over Kafka, with choreographed domain events for what happens after the outcome. Java 21, Spring Boot 4.0.6, PostgreSQL 17, Kafka 4.0 (KRaft), multi-module Maven.
+
+**Checkpoint 2026-10-10:** two more services. **shipping-service** is the saga's third step and its **pivot**: a refused shipment undoes stock and payment in reverse order; a shipping timeout cancels, releases and refunds (state CANCELLING_SHIPMENT). **notification-service** subscribes to `OrderApproved`/`OrderRejected` events on `order.events` (choreography) and is a retriable step: it never affects the order. 33 e2e tests green.
 
 **Checkpoint 2026-10-09:** feature-complete for the core saga plus its failure handling: outbox, idempotency, DLT with backoff and replay, timeouts with fencing, stuck-compensation alerting, and manual resolution. A local **saga console** (`saga-ui`, http://localhost:8080) demos and exercises all of it. 23 e2e tests green, promtool rule tests green. Admin endpoints, seed endpoints and the console are secured with **OAuth2/JWT (Keycloak)**, with roles viewer, operator, admin and metrics. Not yet production-hardened: Keycloak runs in dev mode and the secrets are dev defaults (see [Next / open](#next--open)).
 
@@ -13,14 +15,16 @@ Order saga using orchestration over Kafka. Java 21, Spring Boot 4.0.6, PostgreSQ
 | `order-service` | 8081 | REST API, saga orchestrator, timeout scanner, stuck-compensation metrics, `stucksagas` endpoint (list / detail / retry / resolve) |
 | `payment-service` | 8082 | Debits and refunds customer credit; read/seed APIs for customers and payments |
 | `inventory-service` | 8083 | Reserves and releases stock; read/seed APIs for products and reservations |
-| `saga-ui` | 8080 (127.0.0.1) | Saga console: static single-page UI, same-origin proxy to the three services, Kafka message injector. No DB, no saga-common dependency |
+| `shipping-service` | 8084 | Schedules and cancels shipments (the pivot step); shipping zones decide which destinations are served; read/seed APIs for shipments and zones |
+| `notification-service` | 8085 | Subscribes to order events; notifies the customer through a simulated e-mail provider that can be switched off; read API for notifications |
+| `saga-ui` | 8080 (127.0.0.1) | Saga console: static single-page UI, same-origin proxy to the five services, Kafka message injector. No DB, no saga-common dependency |
 | `saga-e2e` | random | Testcontainers end-to-end tests that run the real service and console jars as child processes |
 
-Each service owns its database (`order_db`, `payment_db`, `inventory_db`) on one Postgres instance. Other files:
+Each service owns its database (`order_db`, `payment_db`, `inventory_db`, `shipping_db`, `notification_db`) on one Postgres instance. Other files:
 - `docker-compose.yml`: Postgres, Kafka, **AKHQ** (Kafka web UI at http://localhost:8086) and **Keycloak** (http://localhost:8180, realm `saga` imported from `docker/keycloak/saga-realm.json`) for local runs.
   - Kafka advertises two client listeners: `localhost:9092` for host apps, and `kafka:29092` on the compose network (AKHQ).
   - Kafka data lives in the named volume `saga-kafka-data` (`KAFKA_LOG_DIRS=/var/lib/kafka/data`, a pinned `CLUSTER_ID`). Topics, messages and offsets survive re-creation; only `down -v` wipes them, together with Postgres.
-- `docker\postgres\init.sql` (creates the three DBs)
+- `docker\postgres\init.sql` (creates the five DBs; an existing volume needs `createdb` for the new ones, see Getting started §3.1)
 - `ops\prometheus\` (alert rules and promtool tests)
 - `ops\RUNBOOK.md` (operator procedures)
 
@@ -31,15 +35,22 @@ POST /orders ─► Order(PENDING) + Saga(PAYMENT_PENDING) + outbox:ProcessPayme
 PAYMENT_PENDING      PaymentProcessed  ─► INVENTORY_PENDING, outbox:ReserveInventory
                      PaymentFailed     ─► FAILED, order REJECTED
                      timeout           ─► COMPENSATING, outbox:RefundPayment            ("Payment timed out")
-INVENTORY_PENDING    InventoryReserved ─► COMPLETED, order APPROVED
+INVENTORY_PENDING    InventoryReserved ─► SHIPPING_PENDING, outbox:ScheduleShipment
                      InventoryFailed   ─► COMPENSATING, outbox:RefundPayment
                      timeout           ─► RELEASING_INVENTORY, outbox:ReleaseInventory  ("Inventory timed out")
+SHIPPING_PENDING     ShipmentScheduled ─► COMPLETED, order APPROVED                     (the pivot)
+                     ShipmentFailed    ─► RELEASING_INVENTORY, outbox:ReleaseInventory
+                     timeout           ─► CANCELLING_SHIPMENT, outbox:CancelShipment    ("Shipping timed out")
+CANCELLING_SHIPMENT  ShipmentCancelled ─► RELEASING_INVENTORY, outbox:ReleaseInventory
+                     timeout           ─► same state, re-send CancelShipment, new deadline
 RELEASING_INVENTORY  InventoryReleased ─► COMPENSATING, outbox:RefundPayment
                      timeout           ─► same state, re-send ReleaseInventory, new deadline
 COMPENSATING         PaymentRefunded   ─► FAILED, order REJECTED (reason = original failure)
                      timeout           ─► same state, re-send RefundPayment, new deadline
-RELEASING_INVENTORY / COMPENSATING  operator retry   ─► same state, re-send now, stuck count reset
-                                    operator resolve ─► FAILED, order REJECTED "<reason> (compensation resolved manually)"
+any compensating state  operator retry   ─► same state, re-send now, stuck count reset
+                        operator resolve ─► FAILED, order REJECTED "<reason> (compensation resolved manually)"
+
+order APPROVED / REJECTED ─► outbox:OrderApproved / OrderRejected on order.events (same transaction) ─► notification-service
 ```
 Replies that don't match the saga's current state (late, duplicate, out of order) are logged and dropped.
 
@@ -48,7 +59,9 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 |---|---|---|---|
 | `payment.commands` | order | payment | ProcessPayment, RefundPayment |
 | `inventory.commands` | order | inventory | ReserveInventory, ReleaseInventory |
-| `order.saga.replies` | payment, inventory | order | PaymentProcessed/Failed/Refunded, InventoryReserved/Failed/Released |
+| `shipping.commands` | order | shipping | ScheduleShipment, CancelShipment |
+| `order.saga.replies` | payment, inventory, shipping | order | PaymentProcessed/Failed/Refunded, InventoryReserved/Failed/Released, ShipmentScheduled/Failed/Cancelled |
+| `order.events` | order | notification | OrderApproved, OrderRejected (domain events; nobody replies) |
 | `<topic>-dlt` (one per topic above) | Spring Kafka error handler | `dlt` replay endpoint | dead-lettered originals with `kafka_dlt-*` headers |
 
 - All topics have 3 partitions (replication factor 1 locally). They are keyed by orderId, so every message for an order is ordered.
@@ -59,9 +72,17 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 **Core**
 - **Transactional outbox everywhere.** Business writes and outgoing messages commit in one DB transaction. `OutboxRelay` polls (500ms) with `FOR UPDATE SKIP LOCKED`. Delivery is at-least-once, and per-key order is preserved with a single relay. With several relay instances, ordering is best-effort.
 - **Idempotent consumers.** `processed_message` uses `INSERT … ON CONFLICT DO NOTHING` in the handler's transaction. Participants also key on `order_id` (unique on `payment` and `reservation`).
-- **Type registry.** It comes from the sealed `SagaCommand`/`SagaReply` permits; a new message type is just a new record. The exhaustive `switch` in the orchestrator then fails to compile until the new reply is handled.
+- **Type registry.** It comes from the sealed `SagaCommand`/`SagaReply`/`OrderEvent` permits; a new message type is just a new record. The exhaustive `switch` in the orchestrator then fails to compile until the new reply is handled.
 - **Package layout.** Main classes sit in package `com.saga`, so scanning covers `com.saga.common` without `@EntityScan` (which moved package in Boot 4). As a consequence, two services can't share a JVM, which is why e2e runs separate processes.
-- **Pessimistic row locks** on `customer_credit`, `product`, `payment` and `reservation` serialize concurrent work per row.
+- **Pessimistic row locks** on `customer_credit`, `product`, `payment`, `reservation`, `shipment` and `shipping_zone` serialize concurrent work per row.
+
+**Steps and events** (2026-10-10)
+- **Compensatable → pivot → retriable.** Payment and inventory are compensatable; shipping is the pivot (last, its success completes the saga); notification is retriable and lives outside the saga.
+- **Compensation runs in reverse.** The compensating states form one chain, CANCELLING_SHIPMENT → RELEASING_INVENTORY → COMPENSATING → FAILED; a failure enters it just below the last step that may have succeeded (ShipmentFailed skips cancelling, a shipping timeout doesn't).
+- **Domain events through the outbox, in the outcome's transaction.** `OrderEventPublisher` is the only way to approve or reject an order, so the orchestrator paths and operator resolve all emit exactly one event.
+- **Choreography for notification.** notification-service subscribes to `order.events`; order-service has no dependency on it. Sends are at-least-once (the provider is called before the row commits); `processed_message` and unique `(order_id, type)` make redeliveries and replays no-ops after a successful send.
+- **Destination on the order** (`destination`, ISO country, optional, default GB) so existing clients keep working.
+- **CANCELLING_SHIPMENT is a compensating state everywhere:** timeouts, stuck metrics, `stucksagas`, retry/resolve. Its SQL lists and partial index were updated in order V6.
 
 **Failure handling**
 - **Blocking retry with exponential backoff, then a DLT** (`KafkaErrorHandlingConfig`).
@@ -83,8 +104,9 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 - **Tombstone fencing.**
   - A refund with no payment on record inserts a payment with status CANCELLED (customer and amount null).
   - A release with no reservation inserts a reservation with status RELEASED.
-  - A later ProcessPayment or ReserveInventory for that order, for example replayed from a DLT, is refused with PaymentFailed or InventoryFailed.
-  - Refund and release always reply, so the saga never hangs on them.
+  - A cancel with no shipment inserts a shipment with status CANCELLED (placeholder product and destination).
+  - A later ProcessPayment, ReserveInventory or ScheduleShipment for that order, for example replayed from a DLT, is refused with PaymentFailed, InventoryFailed or ShipmentFailed.
+  - Refund, release and cancel always reply, so the saga never hangs on them.
 
 **Operability**
 - **Stuck-compensation alerting** (`CompensationMonitor`).
@@ -99,7 +121,7 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 - **Admin APIs are actuator endpoints**, not controllers, so they are off unless exposed.
 
 **Security** (details in [Architecture §9](docs/ARCHITECTURE.md#9-security))
-- **OAuth2/JWT via Keycloak.** The three services are resource servers sharing one rulebook, `SagaSecurityConfig` in saga-common: stateless, deny by default. They validate the signature (JWKS), the issuer `http://localhost:8180/realms/saga` and the audience `saga-api`. Roles are mapped from the `roles` claim by Boot properties (`authorities-claim-name`, `authority-prefix`, `principal-claim-name`); no custom converter.
+- **OAuth2/JWT via Keycloak.** The five services are resource servers sharing one rulebook, `SagaSecurityConfig` in saga-common: stateless, deny by default. They validate the signature (JWKS), the issuer `http://localhost:8180/realms/saga` and the audience `saga-api`. Roles are mapped from the `roles` claim by Boot properties (`authorities-claim-name`, `authority-prefix`, `principal-claim-name`); no custom converter.
 - **Roles** are composite realm roles: `saga-viewer` ⊂ `saga-operator` ⊂ `saga-admin`, plus `saga-metrics`. The `roles` claim and the `saga-api` audience come from protocol mappers on each client, not from a realm-level client scope (a custom `clientScopes` list in an import would replace the built-in `profile`/`basic` scopes).
 - **Public:** health, `POST /orders`, `GET /orders/{id}`. The customer-facing order API is out of scope for now.
 - **Console:** an OIDC client (`saga-console`, auth code), with tokens in the server-side session, token relay through the proxy (`OAuth2AuthorizedClientManager` refreshes them), `csrf.spa()`, and RP-initiated logout. The page reads roles from `/api/me` and disables what the user can't do; the services enforce it regardless.
@@ -116,7 +138,7 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 | `saga.kafka.retry.multiplier` | 2.0 | all | |
 | `saga.kafka.retry.max-interval` | 10s | all | |
 | `spring.kafka.listener.concurrency` | 3 | all | keep equal to the partition count |
-| `saga.timeout.payment` / `.inventory` / `.compensation` | 30s | order | keep well above the retry budget (about 7.5s) |
+| `saga.timeout.payment` / `.inventory` / `.shipping` / `.compensation` | 30s | order | keep well above the retry budget (about 7.5s) |
 | `saga.timeout.scan-interval` | 5s | order | |
 | `saga.timeout.batch-size` | 100 | order | overdue sagas per scan |
 | `saga.alert.stuck-after-resends` | 3 | order | about 2 minutes with 30s compensation timeouts |
@@ -124,22 +146,22 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 
 ## Saga console (`saga-ui`)
 - **Saga tab:**
-  - Scenario buttons seed a fresh customer and product, then place orders: happy path, insufficient credit, out of stock (refund), and a burst of ten.
-  - Order detail has a **transit-map state machine** lighting the route taken (cobalt = forward, amber = compensation), plus a **message timeline**: the order, payment and inventory outboxes merged into swimlanes, with operator interventions included.
-  - Payment and inventory state cards.
+  - Scenario buttons seed a fresh customer and product, then place orders: happy path, insufficient credit, out of stock (refund), unshippable destination (release + refund), and a burst of ten. The order form has a destination.
+  - Order detail has a **transit-map state machine** (4×2: forward steps along the top, compensations right to left along the bottom, no crossing tracks) lighting the route taken (cobalt = forward, amber = compensation), plus a **message timeline**: five swimlanes from the four outboxes and the notifications, with order events dashed and operator interventions included.
+  - Payment, inventory, shipping and notification state cards.
   - The saga card shows the deadline countdown and re-sends, plus Retry/Resolve forms while compensating.
-- **Operations tab:** compensation metric tiles, the stuck-saga list, DLT pending counts with replay, the message injector (presets for non-retryable, retryable-crash, unknown-saga and malformed messages), and a timeout/stuck demo guide.
-- **Customers & products tab:** view and set credit and stock.
-- **API console tab:** a clickable catalogue of **every endpoint** across the three services and the console, with method, path, body and pretty-printed response.
+- **Operations tab:** compensation metric tiles, the stuck-saga list, the notification-provider switch, DLT pending counts with replay, the message injector (presets for non-retryable, retryable-crash, unknown-saga and malformed messages), and a timeout/stuck demo guide.
+- **Reference data tab:** view and set credit, stock and shipping zones (open or close a destination).
+- **API console tab:** a clickable catalogue of **every endpoint** across the five services and the console, with method, path, body and pretty-printed response.
 - **Plumbing:**
-  - `/api/{order|payment|inventory}/**` is a pass-through proxy (status and body untouched; 502 JSON when a service is down; targets in `saga.ui.services.*`). `/api/inject` publishes raw records to the three saga topics only.
+  - `/api/{order|payment|inventory|shipping|notification}/**` is a pass-through proxy (status and body untouched; 502 JSON when a service is down; targets in `saga.ui.services.*`). `/api/inject` publishes raw records to the saga topics only.
   - Links are shareable: `#tab=ops`, `#order=<id>`.
   - Vanilla JS, no build step; server data is rendered with `textContent`. Light and dark themes.
 
 ## REST APIs
 | Endpoint | Service | Purpose |
 |---|---|---|
-| `POST /orders`, `GET /orders/{id}` | order | place an order; order + saga state. **public** |
+| `POST /orders` `{customerId, productId, quantity, amount, destination?}`, `GET /orders/{id}` | order | place an order (destination defaults to GB); order + saga state. **public** |
 | `GET /orders?limit=50` | order | recent orders, newest first (limit 1–200). viewer |
 | `GET /customers`, `GET /customers/{id}` | payment | credit. viewer |
 | `PUT /customers/{id}` `{"availableCredit"}` | payment | set credit (seed tooling). **admin** |
@@ -147,6 +169,10 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 | `GET /products`, `GET /products/{id}` | inventory | stock. viewer |
 | `PUT /products/{id}` `{"availableQuantity"}` | inventory | set stock (seed tooling). **admin** |
 | `GET /reservations/{orderId}` | inventory | RESERVED / RELEASED. viewer |
+| `GET /shipments/{orderId}` | shipping | SCHEDULED (with tracking number) / CANCELLED. viewer |
+| `GET /zones`, `GET /zones/{country}` | shipping | destinations and whether a carrier serves them. viewer |
+| `PUT /zones/{country}` `{"served", "name"?}` | shipping | open, close or create a zone (seed tooling). **admin** |
+| `GET /notifications?orderId=` (or `?limit=`) | notification | notifications sent. viewer |
 
 Roles: viewer < operator < admin (composite); `saga-metrics` only reaches `/actuator/prometheus`. No token → 401, wrong role → 403, unlisted endpoint → 403.
 
@@ -161,6 +187,8 @@ Roles: viewer < operator < admin (composite); `saga-metrics` only reaches `/actu
 | `GET /actuator/stucksagas` | order | stuck sagas, oldest first. viewer |
 | `GET /actuator/stucksagas/{sagaId}` | order | saga detail + intervention history (any saga). viewer |
 | `POST /actuator/stucksagas/{sagaId}` body `{"action","note"}` | order | `retry` / `resolve`, recorded under the token's user. **operator**. 400 bad request, 404 unknown saga, 409 not compensating or concurrent change |
+| `GET /actuator/notificationprovider` | notification | provider available, sent and refused counts. viewer |
+| `POST /actuator/notificationprovider` body `{"available"}` | notification | switch the simulated provider off or on. **operator** |
 | `GET /actuator/metrics` | order | Micrometer. viewer |
 | `GET /actuator/prometheus` | order | Prometheus scrape. metrics or viewer |
 
@@ -189,10 +217,13 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 | inventory | V1 | product, reservation, outbox, processed_message + seed |
 | inventory | V2 | `reservation.status`, `released_at` |
 | order V5 / payment V3 / inventory V3 | – | `outbox(message_key)` index for the outbox endpoint |
+| order | V6 | `orders.destination` (default GB); compensating partial index recreated with CANCELLING_SHIPMENT |
+| shipping | V1 | shipping_zone (+ seed GB/US/DE served, XX not), shipment, outbox, processed_message |
+| notification | V1 | notification (unique order_id + type), outbox (unused), processed_message |
 
 ## Container images
-- **`ops\images.cmd <tag> [push]`** packages the jars and builds six images, `${SAGA_REGISTRY}/saga-*` (default `ghcr.io/srikanthkaushik`):
-  - `saga-order-service`, `saga-payment-service`, `saga-inventory-service` and `saga-console`, from one layered, non-root `docker/app.Dockerfile` (an app update re-pushes about 340 kB; the 91 MB dependency layer is cached);
+- **`ops\images.cmd <tag> [push]`** packages the jars and builds eight images, `${SAGA_REGISTRY}/saga-*` (default `ghcr.io/srikanthkaushik`):
+  - `saga-order-service`, `saga-payment-service`, `saga-inventory-service`, `saga-shipping-service`, `saga-notification-service` and `saga-console`, from one layered, non-root `docker/app.Dockerfile` (an app update re-pushes about 340 kB; the 91 MB dependency layer is cached);
   - `saga-keycloak`, with the realm baked in;
   - `saga-postgres`, with the init script.
 - **Configuration:** the apps are configured through environment variables (Spring relaxed binding), e.g. `SPRING_DATASOURCE_URL`, `SPRING_KAFKA_BOOTSTRAP_SERVERS`, `SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI`, `SAGA_UI_SERVICES_ORDER`. The console needs `SERVER_ADDRESS=0.0.0.0` in a container (it defaults to 127.0.0.1).
@@ -228,6 +259,8 @@ mvn clean install -DskipITs
 start "order"     java -jar order-service\target\order-service-0.0.1-SNAPSHOT.jar
 start "payment"   java -jar payment-service\target\payment-service-0.0.1-SNAPSHOT.jar
 start "inventory" java -jar inventory-service\target\inventory-service-0.0.1-SNAPSHOT.jar
+start "shipping"  java -jar shipping-service\target\shipping-service-0.0.1-SNAPSHOT.jar
+start "notify"    java -jar notification-service\target\notification-service-0.0.1-SNAPSHOT.jar
 start "console"   java -jar saga-ui\target\saga-ui-0.0.1-SNAPSHOT.jar
 start http://localhost:8080
 
@@ -238,14 +271,14 @@ curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/stucksaga
 curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"customer-1\",\"productId\":\"product-1\",\"quantity\":2,\"amount\":100.00}"
 curl http://localhost:8081/orders/<id>
 ```
-- Seed data: `customer-1` has 1000.00 credit and `customer-2` 50.00. `product-1` has qty 100; `product-2` has qty 0, which forces a compensation.
+- Seed data: `customer-1` has 1000.00 credit and `customer-2` 50.00. `product-1` has qty 100; `product-2` has qty 0, which forces a compensation. Shipping zones GB, US and DE are served; XX is not, which forces a release and a refund.
 - Operator commands (DLT replay, stuck sagas, retry/resolve) are in `ops\RUNBOOK.md`; the console does the same from its Operations tab.
 - **Kafka UI:** AKHQ at http://localhost:8086 (cluster `saga-local`; started by `docker compose up -d`). It's read-write and unauthenticated (local only). Replay DLTs with the `dlt` endpoint, not AKHQ's produce or copy.
 - **Editing the console:** to work on the UI without rebuilding, start it with `--spring.web.resources.static-locations=file:saga-ui/src/main/resources/static/ --spring.web.resources.cache.period=0` and refresh the browser.
-- **Faster timeout demo:** start order-service with `--saga.timeout.payment=10s --saga.timeout.compensation=10s`.
+- **Faster timeout demo:** start order-service with `--saga.timeout.payment=10s --saga.timeout.inventory=10s --saga.timeout.shipping=10s --saga.timeout.compensation=10s`.
 
 ## Tests
-- `mvn clean verify` builds everything and runs `SagaEndToEndIT`: 27 tests, about 2 minutes. Docker is required; the suite is skipped automatically without it. Add `-DskipITs` to skip it.
+- `mvn clean verify` builds everything and runs `SagaEndToEndIT`: 33 tests, about 3 minutes. Docker is required; the suite is skipped automatically without it. Add `-DskipITs` to skip it.
 - Alert rules are tested separately:
   ```
   docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prometheus test rules /rules/saga-alerts.test.yml
@@ -261,16 +294,18 @@ curl http://localhost:8081/orders/<id>
 
 | Area | What's proven |
 |---|---|
-| Happy / business paths | approve; insufficient credit; unknown customer; out of stock → refund; 10 concurrent orders on 50 stock → exactly 5 approved and 5 refunded; 400 on invalid input |
+| Happy / business paths | approve (shipment SCHEDULED with tracking number, OrderApproved notified); default destination GB; insufficient credit; unknown customer; out of stock → refund; 10 concurrent orders on 50 stock → exactly 5 approved and 5 refunded; 400 on invalid input |
 | DLT | non-retryable → DLT in under 7s with headers kept; unknown-saga reply → DLT and the flow keeps working; retryable NPE → DLT only after the full backoff (at least 7s), with no side effects |
 | Replay | a reply that arrived before its saga, replayed after the cause is fixed → APPROVED; a still-broken record returns with `dltReplayCount=1`; endpoint scoping and 400s |
 | Timeouts | a stalled participant (poison on every partition) → "Payment timed out" / "Inventory timed out"; the late charge is refunded and the late reservation released |
-| Fencing | refund-before-charge and release-before-reserve leave tombstones, and the late command is refused |
+| Shipping | unshippable destination → release then refund, in that order; closing and reopening a zone; shipping timeout (poison stall) → late shipment cancelled, stock released, payment refunded |
+| Notifications | OrderApproved / OrderRejected events in the order outbox; a notification per outcome, including after operator resolve; provider down → order still approved, event dead-lettered; provider back + replay → exactly one notification, also after a second replay |
+| Fencing | refund-before-charge, release-before-reserve and cancel-before-schedule leave tombstones, and the late command is refused |
 | Alerting | a failing refund (DB trigger) → appears in `stucksagas`, gauge ≥ 1, Prometheus output present; clears after the fix |
 | Intervention | retry resets the count and is audited; resolve after a manual refund → FAILED/REJECTED and the late queued refund is a no-op (no double refund); 400/404/409 cases |
-| Read / seed APIs | payment and reservation status, credit and stock reads; outboxes give exactly `ProcessPayment, ReserveInventory, RefundPayment` / `PaymentProcessed, PaymentRefunded` / `InventoryFailed` for a compensated order; orders list newest-first; PUT upsert, and 400 for negative values or a bad id |
+| Read / seed APIs | payment and reservation status, credit and stock reads; outboxes give exactly `ProcessPayment, ReserveInventory, RefundPayment, OrderRejected` / `PaymentProcessed, PaymentRefunded` / `InventoryFailed` for a compensated order; orders list newest-first; PUT upsert, and 400 for negative values or a bad id |
 | Console (`saga-ui`) | serves the page; seed and order **through the proxy** → APPROVED; upstream 404 passes through; unknown service 404; Prometheus via proxy; `/api/inject` lands on the DLT; non-saga topic → 400 |
-| Security | role matrix (none/viewer/operator/admin × health, actuator read, order list, credit read, DLT replay, seed PUT, unlisted) = 401/403/200 as designed; wrong-realm and garbage tokens → 401 with `WWW-Authenticate: Bearer`; `saga-prometheus` scrapes but can't read DLTs; audit records the token's user even when the body says otherwise; console: redirect to Keycloak, 401 with a marker header for `/api`, scripted login, token relay, CSRF required, viewer can't replay or inject, operator can't seed |
+| Security | role matrix (none/viewer/operator/admin × health, actuator read, order list, credit read, DLT replay, seed PUT, unlisted, zone read, zone PUT, notification read, provider switch) = 401/403/200 as designed; wrong-realm and garbage tokens → 401 with `WWW-Authenticate: Bearer`; `saga-prometheus` scrapes but can't read DLTs; audit records the token's user even when the body says otherwise; console: redirect to Keycloak, 401 with a marker header for `/api`, scripted login, token relay, CSRF required, viewer can't replay or inject, operator can't seed |
 | Alert rules (promtool) | stuck fires once with two instances (`max`), ignores blips shorter than `for`; slow and missing alerts fire. Checked to fail if `max` is swapped for `sum` |
 
 ## Done
@@ -288,6 +323,8 @@ curl http://localhost:8081/orders/<id>
 - [x] 2026-10-09: saga console (`saga-ui`) + read/seed APIs + outbox endpoint.
   - Checked in headless Chrome over CDP: every scenario renders the right status, map route and message count; ops tiles, DLT replay, inject, data save, API console, deep links and intervene (resolve without a note is refused; retry completes the saga) all work, with no JS errors.
   - That browser check is a one-off script and is **not** in the repo.
+
+- [x] 2026-10-10: **shipping-service** (pivot, reverse-order compensation, CANCELLING_SHIPMENT, zones, fencing) and **notification-service** (order events on `order.events`, choreography, retriable step with provider outage, exactly-once notification). Console: 4×2 map, five lanes, destination, zones, provider switch, Unshippable destination scenario. 33 e2e tests green; headless-Chrome check of every new view; manual outage check (shipping-service stopped mid-saga → CANCELLING_SHIPMENT → restart → late shipment cancelled, stock and credit restored, customer notified).
 
 ## Next / open
 - [ ] **Production identity setup:**

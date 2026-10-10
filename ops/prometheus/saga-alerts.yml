@@ -12,10 +12,10 @@ groups:
         annotations:
           summary: "{{ $value }} saga compensation(s) stuck"
           description: >-
-            {{ $value }} saga(s) have re-sent their refund/release command at least
+            {{ $value }} saga(s) have re-sent their cancel/release/refund command at least
             saga.alert.stuck-after-resends times without a reply. Customers may be charged or stock held
             for rejected orders. List them with GET /actuator/stucksagas on order-service, then check
-            GET /actuator/dlt on payment-service / inventory-service for the failing compensation.
+            GET /actuator/dlt on shipping-, inventory- or payment-service for the failing compensation.
             Runbook: ops/RUNBOOK.md
 
       - alert: SagaCompensationSlow

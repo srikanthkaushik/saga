@@ -1,21 +1,21 @@
 # Scenarios: a hands-on lab
 
-Fourteen scenarios, ordered from "see it work" to "break it and fix it". Each has the same parts:
+Seventeen scenarios, ordered from "see it work" to "break it and fix it". Each has the same parts:
 
 > **Learn**: what the scenario teaches · **Do**: console steps and/or CMD commands · **See**: what to expect (real outputs) · **Why**: the code responsible · **Reset**: how to clean up, where needed
 
-**Setup:** everything running as in [Getting started](GETTING-STARTED.md) (infrastructure including Keycloak, three services, console at http://localhost:8080).
+**Setup:** everything running as in [Getting started](GETTING-STARTED.md) (infrastructure including Keycloak, the five services, console at http://localhost:8080).
 - **Console:** sign in as `admin` / `admin`. The scenario buttons create customers and products, which needs the admin role. Scenario 12 shows what an `operator` sees.
 - **CMD:** get a token first with `call ops\token.cmd admin admin`. The commands below send it as `-H "Authorization: Bearer %TOKEN%"`. Placing and reading an order is public and needs none. Tokens last 5 minutes; on a 401, call `ops\token.cmd` again. See [Getting started §4](GETTING-STARTED.md#4-sign-in-users-roles-and-tokens).
-- Scenarios 1–7 and 10 work with default settings.
-- **Scenarios 8, 9, 11 and 12 need order-service started with fast timeouts**, otherwise you wait 30 s per step:
+- Scenarios 1–7, 10, 15 and 17 work with default settings.
+- **Scenarios 8, 9, 11, 12 and 16 need order-service started with fast timeouts**, otherwise you wait 30 s per step:
   ```
-  start "order" java -jar order-service\target\order-service-0.0.1-SNAPSHOT.jar --saga.timeout.payment=10s --saga.timeout.inventory=10s --saga.timeout.compensation=10s --saga.alert.refresh-interval=2s
+  start "order" java -jar order-service\target\order-service-0.0.1-SNAPSHOT.jar --saga.timeout.payment=10s --saga.timeout.inventory=10s --saga.timeout.shipping=10s --saga.timeout.compensation=10s --saga.alert.refresh-interval=2s
   ```
 
 **Reading the console:**
 - **State map.** Lit tracks are the route the saga took: cobalt for forward steps, amber for compensation. The thick-bordered box is the current state.
-- **Message timeline.** One row per message, placed in the lane of the service that **sent** it ("to payment" means it was addressed to payment-service). `+ms` is the time since the order was created.
+- **Message timeline.** One row per message, placed in the lane of the service that **sent** it ("to payment" means it was addressed to payment-service). `+ms` is the time since the order was created. Order events (`OrderApproved`, `OrderRejected`) have a dashed border: they're addressed to whoever subscribes. The e-mail notification-service sent appears in its own lane.
 
 **Ids in commands.** Commands that need an order or saga id use `%ORDER%` / `%SAGA%`. Copy the id from the previous response and run `set ORDER=<id>` first. Customers and products are created with `PUT`, which overwrites, so every scenario can be re-run.
 
@@ -35,12 +35,15 @@ Fourteen scenarios, ordered from "see it work" to "break it and fix it". Each ha
 | 12 | [Operator retry and resolve](#scenario-12--operator-retry-and-resolve) | manual resolution, audit |
 | 13 | [Observability tour](#scenario-13--observability-tour) | outbox endpoint, metrics, alert-rule tests |
 | 14 | [The automated suite](#scenario-14--the-automated-suite) | how the tests map to all of the above |
+| 15 | [Unshippable destination](#scenario-15--unshippable-destination-undo-in-reverse-order) | the pivot, compensation in reverse order |
+| 16 | [Shipping timeout with a real outage](#scenario-16--shipping-timeout-with-a-real-outage) | three-step compensation, cancelling a late shipment |
+| 17 | [Notification outage and replay](#scenario-17--notification-outage-and-replay) | retriable steps after the pivot, choreography, exactly-once notification |
 
 ---
 
 ## Scenario 1 — Happy path
 
-**Learn:** the basic orchestration flow. An order is accepted immediately and completes asynchronously through three local transactions.
+**Learn:** the basic orchestration flow. An order is accepted immediately and completes asynchronously through four local transactions (order, payment, inventory, shipping); then the customer is told.
 
 **Do (console):** Saga tab → **Happy path**.
 
@@ -48,8 +51,9 @@ Fourteen scenarios, ordered from "see it work" to "break it and fix it". Each ha
 ```
 curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8082/customers/alice -H "Content-Type: application/json" -d "{\"availableCredit\":500}"
 curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8083/products/widget -H "Content-Type: application/json" -d "{\"availableQuantity\":10}"
-curl -i -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":2,\"amount\":120.00}"
+curl -i -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":2,\"amount\":120.00,\"destination\":\"US\"}"
 ```
+`destination` is a two-letter country code. Leave it out and the order ships to `GB`.
 
 **See:**
 - **The POST returns at once.** `HTTP/1.1 201`, `Location: /orders/<id>`, with `"status":"PENDING","sagaState":"PAYMENT_PENDING"`.
@@ -59,23 +63,29 @@ curl -i -X POST http://localhost:8081/orders -H "Content-Type: application/json"
   - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/reservations/%ORDER%` → `"status":"RESERVED"`, quantity 2
   - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/customers/alice` → `380.00`
   - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/products/widget` → `8`
-- **The four messages,** one outbox per service:
+  - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8084/shipments/%ORDER%` → `"status":"SCHEDULED"`, destination US, a `TRK-…` tracking number
+  - `curl -H "Authorization: Bearer %TOKEN%" "http://localhost:8085/notifications?orderId=%ORDER%"` → one `ORDER_APPROVED` e-mail to `alice@customers.example`
+- **The seven messages,** one outbox per service:
   ```
-  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/outbox/%ORDER%    → ProcessPayment, ReserveInventory   (commands)
-  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/actuator/outbox/%ORDER%    → PaymentProcessed                   (reply)
-  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/actuator/outbox/%ORDER%    → InventoryReserved                  (reply)
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/outbox/%ORDER%    → ProcessPayment, ReserveInventory, ScheduleShipment (commands), OrderApproved (event)
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/actuator/outbox/%ORDER%    → PaymentProcessed     (reply)
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/actuator/outbox/%ORDER%    → InventoryReserved    (reply)
+  curl -H "Authorization: Bearer %TOKEN%" http://localhost:8084/actuator/outbox/%ORDER%    → ShipmentScheduled    (reply)
   ```
-- **Console:** a straight cobalt route Payment pending → Inventory pending → Completed, and four timeline rows (e.g. +25 ms, +420 ms, +750 ms, +950 ms).
+- **Console:** a straight cobalt route along the top, Payment pending → Inventory pending → Shipping pending → Completed. The timeline has the seven messages plus the e-mail in the notification lane.
 - **Logs:**
   - payment window: `Order <id> -> PaymentProcessed`
   - inventory window: `Order <id> -> InventoryReserved`
-  - order window: `Saga <sagaId> for order <id> -> INVENTORY_PENDING`, then `… -> COMPLETED`
+  - shipping window: `Order <id> -> ShipmentScheduled`
+  - order window: `Saga <sagaId> for order <id> -> INVENTORY_PENDING`, `… -> SHIPPING_PENDING`, then `… -> COMPLETED`
+  - notification window: `EMAIL to alice@customers.example: Your order … is on its way | …`
 
 **Why:**
 - [`OrderService.create`](../order-service/src/main/java/com/saga/order/api/OrderService.java) writes the order, the saga (with its deadline) and a `ProcessPayment` outbox row in one transaction.
 - [`OutboxRelay`](../saga-common/src/main/java/com/saga/common/outbox/OutboxRelay.java) publishes the outbox row.
-- [`PaymentCommandHandler`](../payment-service/src/main/java/com/saga/payment/PaymentCommandHandler.java) and [`InventoryCommandHandler`](../inventory-service/src/main/java/com/saga/inventory/InventoryCommandHandler.java) each do one transaction and write their reply to their own outbox.
-- [`OrderSagaOrchestrator.onReply`](../order-service/src/main/java/com/saga/order/saga/OrderSagaOrchestrator.java) advances the state machine.
+- [`PaymentCommandHandler`](../payment-service/src/main/java/com/saga/payment/PaymentCommandHandler.java), [`InventoryCommandHandler`](../inventory-service/src/main/java/com/saga/inventory/InventoryCommandHandler.java) and [`ShippingCommandHandler`](../shipping-service/src/main/java/com/saga/shipping/ShippingCommandHandler.java) each do one transaction and write their reply to their own outbox.
+- [`OrderSagaOrchestrator.onReply`](../order-service/src/main/java/com/saga/order/saga/OrderSagaOrchestrator.java) advances the state machine. On ShipmentScheduled, [`OrderEventPublisher`](../order-service/src/main/java/com/saga/order/saga/OrderEventPublisher.java) approves the order and writes `OrderApproved` to the outbox in the same transaction.
+- [`NotificationHandler`](../notification-service/src/main/java/com/saga/notification/NotificationHandler.java) consumes the event and sends the e-mail.
 
 ---
 
@@ -94,7 +104,7 @@ curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d
 **See:**
 - `"status":"REJECTED"`, `"rejectionReason":"Insufficient credit"`, `"sagaState":"FAILED"`.
 - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → **404**: no charge was ever made.
-- **Only two messages:** `ProcessPayment` (order) and `PaymentFailed` (payment). Inventory is never contacted.
+- **Only three messages:** `ProcessPayment` (order), `PaymentFailed` (payment) and the `OrderRejected` event. Inventory and shipping are never contacted. The customer still gets an e-mail saying why.
 - **Console:** one cobalt track, from Payment pending straight down to Failed.
 
 **Why:** `PaymentCommandHandler.process` replies `PaymentFailed` instead of debiting. In the orchestrator, `PaymentFailed` in PAYMENT_PENDING goes directly to FAILED and rejects the order.
@@ -120,9 +130,9 @@ curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d
 - `"status":"REJECTED"`, `"rejectionReason":"Insufficient stock"`, `"sagaState":"FAILED"`.
 - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/payments/%ORDER%` → `"status":"REFUNDED"`. The charge happened and was reversed.
 - `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/customers/carol` → back to `500.00`.
-- **Six messages, in this order:**
+- **Seven messages, in this order:**
 
-  | order (commands) | payment (replies) | inventory (replies) |
+  | order (commands, event) | payment (replies) | inventory (replies) |
   |---|---|---|
   | ProcessPayment | | |
   | | PaymentProcessed | |
@@ -130,6 +140,7 @@ curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d
   | | | InventoryFailed |
   | RefundPayment | | |
   | | PaymentRefunded | |
+  | OrderRejected | | |
 
 - **Console:** cobalt Payment pending → Inventory pending, then **amber** Inventory pending → Refunding payment → Failed. Note the rejection reason is the *original* failure ("Insufficient stock"), not "refunded".
 
@@ -350,7 +361,7 @@ The result:
 - **Reservation:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/reservations/%ORDER%` → `"status":"RELEASED"`. The late reservation was made, then released.
 - **Stock and payment:** stock is back to `10`, the payment is `REFUNDED`, and alice's credit is back where it started.
 - **Messages:**
-  - order: `ProcessPayment, ReserveInventory, ReleaseInventory ×N, RefundPayment`
+  - order: `ProcessPayment, ReserveInventory, ReleaseInventory ×N, RefundPayment, OrderRejected`
   - inventory: `InventoryReserved, InventoryReleased ×N`
   - payment: `PaymentProcessed, PaymentRefunded`
 - **Console:** cobalt to Inventory pending, then amber Inventory pending → Releasing inventory → Refunding payment → Failed.
@@ -467,7 +478,7 @@ Now start payment-service again.
 
 | Question | Look at |
 |---|---|
-| What happened to this order? | Console order detail, or `GET /actuator/outbox/{orderId}` on all three services (commands from order-service, replies from the participants) |
+| What happened to this order? | Console order detail, or `GET /actuator/outbox/{orderId}` on order, payment, inventory and shipping (commands and events from order-service, replies from the participants). `GET /notifications?orderId=` on notification-service shows what the customer was told |
 | What is actually on the topics? | AKHQ at http://localhost:8086: messages, headers, Live Tail, search by key (orderId) ([Getting started §9](GETTING-STARTED.md#kafka-in-the-browser-akhq)) |
 | Is a message stuck? | `GET /actuator/dlt` on each service. Kafka lag: AKHQ's **Consumer Groups**, or `kafka-consumer-groups.sh --describe --group <service>` ([Getting started §9](GETTING-STARTED.md#kafka-from-the-command-line)) |
 | Is any compensation stuck? | `GET /actuator/stucksagas`, the gauge `saga.compensation.stuck`, the log line `STUCK COMPENSATION` |
@@ -486,13 +497,13 @@ Try this: open the **API console** tab. Click through the catalogue entries for 
 ```
 mvn clean verify
 ```
-(Stop your local services first. The suite brings up its own Postgres and Kafka with Testcontainers and runs the four real jars. It takes about 2 minutes.)
+(Stop your local services first. The suite brings up its own Postgres, Kafka and Keycloak with Testcontainers and runs the six real jars. It takes about 3 minutes.)
 
 To speed things up, the tests run the services with 1 s/2 s/4 s backoff, 3 s step timeouts, a stuck threshold of 2, and 500 ms gauge refresh. Logs from the run are in `saga-e2e\target\e2e-logs\`.
 
 | Test in [`SagaEndToEndIT`](../saga-e2e/src/test/java/com/saga/e2e/SagaEndToEndIT.java) | Scenario |
 |---|---|
-| `happyPath_approvesOrder_debitsCreditAndReservesStock` | 1 |
+| `happyPath_approvesOrder_debitsCredit_reservesStock_andSchedulesShipment`, `orderWithoutDestination_shipsToTheDefaultCountry` | 1 |
 | `insufficientCredit_rejectsOrder_andNeverTouchesInventory`, `unknownCustomer_rejectsOrder` | 2 |
 | `outOfStock_compensatesWithRefund_andRejectsOrder` | 3 |
 | `concurrentOrders_neverOversellStock_andRefundTheLosers` | 4 |
@@ -504,7 +515,99 @@ To speed things up, the tests run the services with 1 s/2 s/4 s backoff, 3 s ste
 | `failingRefund_isReportedAsStuck_andClearsOnceTheRefundSucceeds` (a DB trigger makes refunds fail) | 11 |
 | `retry_resendsCompensation_resetsStuckCount_andIsAudited`, `resolve_afterManualRefund_closesSaga_andLateCompensationDoesNotRefundTwice`, `intervention_rejectsBadRequests` | 12 |
 | `readApis_exposeParticipantState_andOutboxesFormTheTimeline`, `seedApis_upsertAndValidate`, `sagaConsole_servesPage_proxiesServices_andInjectsMessages` | 13 and the console |
+| `unshippableDestination_releasesStock_thenRefunds_inReverseOrder`, `closingAShippingZone_makesOrdersToItFail` | 15 |
+| `shippingTimeout_cancelsTheLateShipment_releasesStock_refunds_andRejectsOrder`, `cancelBeforeSchedule_leavesTombstone_andRefusesTheLateShipment` | 16 |
+| `notificationOutage_neverAffectsTheOrder_andReplayNotifiesExactlyOnce` | 17 |
+| `services_enforceRolesPerEndpoint`, `console_requiresLogin_relaysTheUsersToken_andChecksCsrfAndRoles`, `services_rejectTokensFromTheWrongIssuer_andGarbage`, `prometheusClient_canScrapeMetrics_butNothingElse` | security ([Architecture §9](ARCHITECTURE.md#9-security)) |
 
 Duplicate delivery (Scenario 5) is covered implicitly. Every compensation re-send and every replay in the suite relies on it.
+
+---
+
+## Scenario 15 — Unshippable destination: undo in reverse order
+
+**Learn:** the **pivot**. Shipping is the last step and the point of no return. When it refuses, the two steps before it are undone **in reverse order**: first the stock is released, then the payment refunded.
+
+**Do (console):** **Unshippable destination**. It orders to `XX`, a country no carrier serves.
+
+**Do (CMD):**
+```
+curl -H "Authorization: Bearer %TOKEN%" http://localhost:8084/zones
+curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":1,\"amount\":60.00,\"destination\":\"XX\"}"
+```
+The zone list shows GB, US and DE served and XX not.
+
+**See:**
+- **Order:** `"status":"REJECTED"`, `"rejectionReason":"No carrier serves XX"`.
+- **Everything undone:** the reservation is `RELEASED` and the stock back where it was; the payment is `REFUNDED` and alice's credit unchanged. `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8084/shipments/%ORDER%` → **404**: nothing was ever scheduled.
+- **Messages from order-service, in order:** `ProcessPayment, ReserveInventory, ScheduleShipment, ReleaseInventory, RefundPayment, OrderRejected`. Release comes before refund.
+- **Console:** cobalt along the top to Shipping pending, then amber straight down ("ShipmentFailed") to Releasing inventory, and right-to-left along the bottom: Refunding payment → Failed.
+
+**Try also:** close a real destination. Data tab → **Shipping zones** → **Close** on GB (or `curl -H "Authorization: Bearer %TOKEN%" -X PUT http://localhost:8084/zones/GB -H "Content-Type: application/json" -d "{\"served\":false}"`). Every order to GB now fails the same way. **Open** it again afterwards.
+
+**Why:** [`ShippingCommandHandler.schedule`](../shipping-service/src/main/java/com/saga/shipping/ShippingCommandHandler.java) replies `ShipmentFailed` for an unserved zone. In the orchestrator, `ShipmentFailed` in SHIPPING_PENDING moves to RELEASING_INVENTORY (not COMPENSATING), so the release runs first and its reply starts the refund. Compare Scenario 3, where inventory failed and only the refund was needed.
+
+---
+
+## Scenario 16 — Shipping timeout with a real outage
+
+*Needs the fast-timeout order-service.*
+
+**Learn:** a **three-step** compensation. When shipping doesn't answer, the saga can't know whether a shipment was scheduled, so it cancels it (whatever happened), then releases, then refunds.
+
+**Do:**
+1. Close the **shipping** window. Its health dot turns red.
+2. Place an order with **Place an order** in the console, or:
+   ```
+   curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":1,\"amount\":30.00}"
+   ```
+3. Within a second alice is charged and the stock reserved; the saga waits in SHIPPING_PENDING. After about 10 s it moves to **CANCELLING_SHIPMENT** and re-sends `CancelShipment` every 10 s.
+4. Start shipping-service again: `start "shipping" java -jar shipping-service\target\shipping-service-0.0.1-SNAPSHOT.jar`.
+
+**See:**
+- **shipping window:** `Order … -> ShipmentScheduled` (the late schedule went through), then `Order … -> ShipmentCancelled` (the cancel queued behind it undid it), then more `ShipmentCancelled` for the re-sends.
+- **Shipment:** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8084/shipments/%ORDER%` → `"status":"CANCELLED"`, with the tracking number it had.
+- **Order:** `"status":"REJECTED"`, `"rejectionReason":"Shipping timed out"`; reservation `RELEASED`, payment `REFUNDED`, stock and credit restored.
+- **order window:** `ignoring ShipmentScheduled (expected state SHIPPING_PENDING)`: the late success can't complete a saga that is already compensating.
+- **Console:** cobalt to Shipping pending, then amber to Cancelling shipment, and the full bottom row right to left: Releasing inventory → Refunding payment → Failed.
+
+**Try also:** while the saga is in CANCELLING_SHIPMENT, leave shipping down until the saga is reported stuck (Operations tab, as in Scenario 11). The [Runbook](../ops/RUNBOOK.md) explains how to resolve a stuck CANCELLING_SHIPMENT saga by hand.
+
+**Why:** `OrderSagaOrchestrator.onTimeout` in SHIPPING_PENDING sends `CancelShipment`; `ShipmentCancelled` leads to `ReleaseInventory`, and `InventoryReleased` to `RefundPayment`. `ShippingCommandHandler.cancel` cancels a scheduled shipment, or leaves a CANCELLED tombstone that refuses a later schedule (e2e: `cancelBeforeSchedule_leavesTombstone_andRefusesTheLateShipment`).
+
+---
+
+## Scenario 17 — Notification outage and replay
+
+**Learn:** a **retriable** step. Notifying the customer comes after the pivot, so it must never fail an order. If the e-mail gateway is down, the event is retried, dead-lettered and replayed later. And because notification-service merely *subscribes* to order events (choreography), the orchestrator neither knows nor cares.
+
+**Do (console):**
+1. Operations → **Notification provider** → **Take the provider down**. (Needs the operator role.)
+2. Saga tab → **Happy path**. The order is **approved** as usual. The Notification card says *not yet*.
+3. Watch the notification window: `Delivery attempt 1 failed … ProviderUnavailableException`, four more attempts over about 8 s, then `Dead-lettered order.events-… to order.events-dlt`. On the Operations tab, `order.events-dlt` (notification-service) shows 1 pending.
+4. **Bring the provider back**, then press **Replay** on the `order.events-dlt` card.
+
+**Do (CMD):**
+```
+call ops\token.cmd operator operator
+curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8085/actuator/notificationprovider -H "Content-Type: application/json" -d "{\"available\":false}"
+curl -X POST http://localhost:8081/orders -H "Content-Type: application/json" -d "{\"customerId\":\"alice\",\"productId\":\"widget\",\"quantity\":1,\"amount\":10.00}"
+curl -H "Authorization: Bearer %TOKEN%" http://localhost:8085/actuator/dlt/order.events
+curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8085/actuator/notificationprovider -H "Content-Type: application/json" -d "{\"available\":true}"
+curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8085/actuator/dlt/order.events -H "Content-Type: application/json" -d "{}"
+curl -H "Authorization: Bearer %TOKEN%" "http://localhost:8085/notifications?orderId=%ORDER%"
+```
+
+**See:**
+- **The order was never affected:** APPROVED while the provider was down.
+- **After the replay:** exactly one `ORDER_APPROVED` notification for the order. Replay again: still one.
+- `GET /actuator/notificationprovider` counts sends that went through and that were refused.
+
+**Why:**
+- [`NotificationHandler`](../notification-service/src/main/java/com/saga/notification/NotificationHandler.java) lets the provider's exception propagate, so the shared error handler retries and dead-letters it like any other failure.
+- `processed_message` and the unique `(order_id, type)` in `notification` make every redelivery or replay after a successful send a no-op.
+- The [`NotificationProvider`](../notification-service/src/main/java/com/saga/notification/NotificationProvider.java) is called before the row commits, so a crash in between would re-send the e-mail: at-least-once, as with any real gateway.
+
+---
 
 Next: the [Codebase tour](CODEBASE.md) shows where each piece lives and how to extend it.

@@ -1,6 +1,6 @@
 # SAGA operator runbook
 
-Commands are for Windows CMD against local ports: order 8081, payment 8082, inventory 8083. Replace the hosts for other environments.
+Commands are for Windows CMD against local ports: order 8081, payment 8082, inventory 8083, shipping 8084, notification 8085. Replace the hosts for other environments.
 
 > Admin endpoints need a Keycloak token: `call ops\token.cmd <user> <password>`, then `-H "Authorization: Bearer %TOKEN%"`. **Reading** needs `saga-viewer`; **replay, retry and resolve** need `saga-operator`; seed `PUT`s need `saga-admin`. The audit records the token's user, not anything in the request body. Tokens last 5 minutes. Local dev users: `viewer`, `operator`, `admin` (password = username).
 
@@ -10,7 +10,7 @@ Commands are for Windows CMD against local ports: order 8081, payment 8082, inve
 
 ## SagaCompensationStuck (page)
 
-**Meaning:** at least one saga keeps re-sending a refund (`COMPENSATING`) or an inventory release (`RELEASING_INVENTORY`) without getting a reply. Until it's fixed, the customer may be **charged for a rejected order**, or stock may be **held** for it.
+**Meaning:** at least one saga keeps re-sending a refund (`COMPENSATING`), an inventory release (`RELEASING_INVENTORY`) or a shipment cancellation (`CANCELLING_SHIPMENT`) without getting a reply. Until it's fixed, the customer may be **charged for a rejected order**, stock may be **held** for it, or a shipment may still be **scheduled** for it.
 
 ### 1. Find the sagas
 ```
@@ -19,6 +19,7 @@ curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/stucksaga
 Each entry shows `sagaId`, `orderId`, `state`, `failureReason`, `compensationResends` and `compensatingSince`.
 - `COMPENSATING`: the refund is not completing. Look at **payment-service**.
 - `RELEASING_INVENTORY`: the release is not completing. Look at **inventory-service**.
+- `CANCELLING_SHIPMENT`: the cancellation is not completing. Look at **shipping-service**.
 
 History for one saga, including earlier interventions:
 ```
@@ -26,14 +27,15 @@ curl -H "Authorization: Bearer %TOKEN%" http://localhost:8081/actuator/stucksaga
 ```
 
 ### 2. Find the cause
-1. **Is the participant up?** `curl http://localhost:8082/actuator/health` (payment) or `:8083` (inventory).
+1. **Is the participant up?** `curl http://localhost:8082/actuator/health` (payment), `:8083` (inventory) or `:8084` (shipping).
 2. **Are its compensations dead-lettering?**
    ```
    curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/actuator/dlt/payment.commands
    curl -H "Authorization: Bearer %TOKEN%" http://localhost:8083/actuator/dlt/inventory.commands
+   curl -H "Authorization: Bearer %TOKEN%" http://localhost:8084/actuator/dlt/shipping.commands
    ```
    If `pending` is greater than 0, the participant's log has a `Dead-lettered payment.commands-…` ERROR line with the root cause. Every failed attempt also logs a `Delivery attempt N failed …` WARN.
-3. **Is the reply getting back?** Look for `ignoring PaymentRefunded` / `ignoring InventoryReleased` WARN lines in the order-service log. If there are none and the participant shows the refund done, check that the participant's outbox is publishing: its `outbox` table should have no old rows with `published_at is null`.
+3. **Is the reply getting back?** Look for `ignoring PaymentRefunded` / `ignoring InventoryReleased` / `ignoring ShipmentCancelled` WARN lines in the order-service log. If there are none and the participant shows the refund done, check that the participant's outbox is publishing: its `outbox` table should have no old rows with `published_at is null`.
 
 ### 3a. Cause fixed → retry (preferred)
 Once the participant is healthy again (redeployed, data fixed, DLT replayed):
@@ -83,13 +85,31 @@ commit;
 ```
 If there is no reservation row, insert a tombstone (`status = 'RELEASED'`, `released_at = now()`, with the order's product_id and quantity).
 
-For a `RELEASING_INVENTORY` saga, release by hand **and** refund by hand: resolving skips both remaining steps.
+Cancel a shipment by hand (shipping_db):
+```sql
+update shipment set status = 'CANCELLED', cancelled_at = now()
+ where order_id = '<orderId>' and status = 'SCHEDULED';
+```
+If there is no shipment row, insert a tombstone so a late schedule is refused:
+```sql
+insert into shipment (id, order_id, product_id, quantity, destination, status, created_at, cancelled_at)
+values (gen_random_uuid(), '<orderId>', '-', 1, '--', 'CANCELLED', now(), now());
+```
+If the goods have physically left, cancelling the record isn't enough: that is a returns process outside the saga.
+
+**Resolving skips every remaining step**, so compensate by hand everything from the saga's state down:
+
+| Saga state | Do by hand, then resolve |
+|---|---|
+| `CANCELLING_SHIPMENT` | cancel the shipment, release the stock, refund the payment |
+| `RELEASING_INVENTORY` | release the stock, refund the payment |
+| `COMPENSATING` | refund the payment |
 
 Then resolve. The note is mandatory; say what you did and where:
 ```
 curl -H "Authorization: Bearer %TOKEN%" -X POST http://localhost:8081/actuator/stucksagas/<sagaId> -H "Content-Type: application/json" -d "{\"action\":\"resolve\",\"note\":\"Refunded in payment_db, ticket <id>\"}"
 ```
-The saga becomes `FAILED`, and the order becomes `REJECTED` with reason `"<original reason> (compensation resolved manually)"`.
+The saga becomes `FAILED`, and the order becomes `REJECTED` with reason `"<original reason> (compensation resolved manually)"`. An `OrderRejected` event is published as for any rejection, so the customer is notified.
 
 ### Responses
 | Status | Meaning |
@@ -117,6 +137,8 @@ Each service only sees and replays its own DLT:
 | order | `order.saga.replies-dlt` |
 | payment | `payment.commands-dlt` |
 | inventory | `inventory.commands-dlt` |
+| shipping | `shipping.commands-dlt` |
+| notification | `order.events-dlt` |
 
 ```
 curl -H "Authorization: Bearer %TOKEN%" http://localhost:8082/actuator/dlt
@@ -127,3 +149,9 @@ To look at what was dead-lettered and why (local stack), open AKHQ at http://loc
 - **Replay is safe to repeat.** Each record keeps its `messageId`, so consumers skip anything already processed.
 - **Commands for finished sagas are refused safely.** Replaying a charge or reservation for a saga that has already been compensated hits the tombstone and is refused. That's expected, not an error.
 - **Replies for finished sagas are dropped** by the orchestrator's state guard (WARN `ignoring …`).
+
+## Customers not being notified (no alert yet)
+Orders are decided regardless of notification-service; only the e-mail is late. Check, on notification-service (8085):
+1. **Up?** `curl http://localhost:8085/actuator/health`.
+2. **Provider switched off?** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8085/actuator/notificationprovider`. If `"available":false`, someone took it down (operator role); bring it back with `POST … -d "{\"available\":true}"`.
+3. **Dead-lettered events?** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8085/actuator/dlt/order.events`. Once the provider works, replay them (`POST /actuator/dlt/order.events`). Each order outcome is notified at most once however often you replay.
