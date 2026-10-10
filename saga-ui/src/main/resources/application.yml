@@ -39,6 +39,7 @@ saga:
       payment: http://localhost:8082
       inventory: http://localhost:8083
       shipping: http://localhost:8084
+      notification: http://localhost:8085
 
 management:
   endpoints:

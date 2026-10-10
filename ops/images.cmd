@@ -17,7 +17,7 @@ call mvn -q clean package -DskipITs
 if errorlevel 1 exit /b 1
 
 echo == Building images %SAGA_REGISTRY%/saga-*:%TAG%
-for %%m in (order-service payment-service inventory-service shipping-service) do (
+for %%m in (order-service payment-service inventory-service shipping-service notification-service) do (
     docker build -q -f docker\app.Dockerfile --build-arg MODULE=%%m -t %SAGA_REGISTRY%/saga-%%m:%TAG% -t %SAGA_REGISTRY%/saga-%%m:latest .
     if errorlevel 1 exit /b 1
 )
@@ -33,7 +33,7 @@ if /i not "%~2"=="push" (
     exit /b 0
 )
 echo == Pushing
-for %%i in (order-service payment-service inventory-service shipping-service console keycloak postgres) do (
+for %%i in (order-service payment-service inventory-service shipping-service notification-service console keycloak postgres) do (
     docker push -q %SAGA_REGISTRY%/saga-%%i:%TAG%
     if errorlevel 1 exit /b 1
     if /i not "%TAG%"=="latest" (

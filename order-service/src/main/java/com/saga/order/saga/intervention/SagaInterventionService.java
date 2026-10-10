@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.saga.order.domain.Order;
+import com.saga.order.saga.OrderEventPublisher;
 import com.saga.order.saga.OrderSaga;
 import com.saga.order.saga.OrderSagaOrchestrator;
 import com.saga.order.saga.OrderSagaRepository;
@@ -30,15 +31,18 @@ public class SagaInterventionService {
     private final SagaInterventionRepository interventionRepository;
     private final OrderSagaOrchestrator orchestrator;
     private final SagaTimeoutProperties timeouts;
+    private final OrderEventPublisher events;
 
     public SagaInterventionService(OrderSagaRepository sagaRepository,
                                    SagaInterventionRepository interventionRepository,
                                    OrderSagaOrchestrator orchestrator,
-                                   SagaTimeoutProperties timeouts) {
+                                   SagaTimeoutProperties timeouts,
+                                   OrderEventPublisher events) {
         this.sagaRepository = sagaRepository;
         this.interventionRepository = interventionRepository;
         this.orchestrator = orchestrator;
         this.timeouts = timeouts;
+        this.events = events;
     }
 
     @Transactional(readOnly = true)
@@ -71,7 +75,7 @@ public class SagaInterventionService {
             }
             case RESOLVE -> {
                 saga.resolveManually();
-                order.reject(saga.getFailureReason() + " (compensation resolved manually)");
+                events.reject(order, saga.getFailureReason() + " (compensation resolved manually)");
             }
         }
 

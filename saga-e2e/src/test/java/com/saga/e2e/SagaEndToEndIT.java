@@ -95,6 +95,7 @@ class SagaEndToEndIT {
     private static ServiceProcess paymentService;
     private static ServiceProcess inventoryService;
     private static ServiceProcess shippingService;
+    private static ServiceProcess notificationService;
     private static ServiceProcess uiService;
     private static KafkaProbe kafka;
 
@@ -105,12 +106,14 @@ class SagaEndToEndIT {
         paymentService = launch("payment-service", "saga.e2e.payment-jar", "payment_db", logDir);
         inventoryService = launch("inventory-service", "saga.e2e.inventory-jar", "inventory_db", logDir);
         shippingService = launch("shipping-service", "saga.e2e.shipping-jar", "shipping_db", logDir);
+        notificationService = launch("notification-service", "saga.e2e.notification-jar", "notification_db", logDir);
         uiService = ServiceProcess.start("saga-ui", Path.of(System.getProperty("saga.e2e.ui-jar")), logDir, Map.of(
                 "spring.kafka.bootstrap-servers", KAFKA.getBootstrapServers(),
                 "saga.ui.services.order", orderService.baseUrl(),
                 "saga.ui.services.payment", paymentService.baseUrl(),
                 "saga.ui.services.inventory", inventoryService.baseUrl(),
                 "saga.ui.services.shipping", shippingService.baseUrl(),
+                "saga.ui.services.notification", notificationService.baseUrl(),
                 "spring.security.oauth2.client.provider.keycloak.issuer-uri", KEYCLOAK.issuer()));
         SERVICES.add(uiService);
         KEYCLOAK.allowConsoleAt(uiService.baseUrl());
@@ -150,8 +153,14 @@ class SagaEndToEndIT {
         assertThat(shipment.get("status").asString()).isEqualTo("SCHEDULED");
         assertThat(shipment.get("destination").asString()).isEqualTo("US");
         assertThat(shipment.get("trackingNumber").asString()).startsWith("TRK-");
-        assertThat(outboxTypes(orderService, orderId)).containsExactly("ProcessPayment", "ReserveInventory", "ScheduleShipment");
+        assertThat(outboxTypes(orderService, orderId))
+                .containsExactly("ProcessPayment", "ReserveInventory", "ScheduleShipment", "OrderApproved");
         assertThat(outboxTypes(shippingService, orderId)).containsExactly("ShipmentScheduled");
+
+        // The OrderApproved event reaches notification-service, which tells the customer once
+        JsonNode sent = awaitNotification(orderId, "ORDER_APPROVED");
+        assertThat(sent.get("recipient").asString()).isEqualTo(customer + "@customers.example");
+        assertThat(sent.get("body").asString()).contains("250.00").contains(shipment.get("trackingNumber").asString());
     }
 
     @Test
@@ -181,8 +190,10 @@ class SagaEndToEndIT {
         assertThat(credit(customer)).isEqualByComparingTo("100.00");
         // Compensation runs backwards through the steps that succeeded: inventory first, then payment
         assertThat(outboxTypes(orderService, orderId))
-                .containsExactly("ProcessPayment", "ReserveInventory", "ScheduleShipment", "ReleaseInventory", "RefundPayment");
+                .containsExactly("ProcessPayment", "ReserveInventory", "ScheduleShipment", "ReleaseInventory", "RefundPayment",
+                        "OrderRejected");
         assertThat(outboxTypes(shippingService, orderId)).containsExactly("ShipmentFailed");
+        assertThat(awaitNotification(orderId, "ORDER_REJECTED").get("body").asString()).contains("No carrier serves XX");
     }
 
     @Test
@@ -616,7 +627,8 @@ class SagaEndToEndIT {
         assertThat(JSON.readTree(get(inventoryService, "/products/" + product)).get("availableQuantity").asInt()).isZero();
 
         // Commands live in order-service's outbox, replies in the participants': together the saga's timeline
-        assertThat(outboxTypes(orderService, orderId)).containsExactly("ProcessPayment", "ReserveInventory", "RefundPayment");
+        assertThat(outboxTypes(orderService, orderId))
+                .containsExactly("ProcessPayment", "ReserveInventory", "RefundPayment", "OrderRejected");
         assertThat(outboxTypes(paymentService, orderId)).containsExactly("PaymentProcessed", "PaymentRefunded");
         assertThat(outboxTypes(inventoryService, orderId)).containsExactly("InventoryFailed");
         JsonNode first = JSON.readTree(get(orderService, "/actuator/outbox/" + orderId)).get(0);
@@ -679,6 +691,68 @@ class SagaEndToEndIT {
                 .statusCode()).isEqualTo(400);
     }
 
+    // ---- notifications (retriable, after the pivot) ----------------------------------------------
+
+    @Test
+    void notificationOutage_neverAffectsTheOrder_andReplayNotifiesExactlyOnce() throws Exception {
+        UUID orderId;
+        setNotificationProvider(false);
+        try {
+            orderId = placeOrder(seedCustomer("100.00"), seedProduct(5), 1, "10.00");
+            assertThat(awaitTerminal(orderId).get("status").asString()).isEqualTo("APPROVED");
+
+            UUID eventId = outboxMessageId(orderService, orderId, "OrderApproved");
+            ConsumerRecord<String, String> dead = kafka.awaitDeadLetter("order.events-dlt", eventId, DLT_TIMEOUT)
+                    .orElseThrow(() -> new AssertionError("event " + eventId + " never reached order.events-dlt"));
+            assertThat(exceptionHeaders(dead)).contains("ProviderUnavailableException");
+            assertThat(notifications(orderId)).isEmpty();
+            assertThat(getOrder(orderId).get("status").asString()).isEqualTo("APPROVED");
+        } finally {
+            setNotificationProvider(true);
+        }
+
+        JsonNode result = replay(notificationService, "order.events", "{\"limit\":1000}");
+        assertThat(result.get("replayed").asInt()).isGreaterThanOrEqualTo(1);
+        awaitNotification(orderId, "ORDER_APPROVED");
+
+        // Replaying again (or a redelivery) never notifies twice
+        replay(notificationService, "order.events", "{\"limit\":1000}");
+        Thread.sleep(1000);
+        assertThat(notifications(orderId)).hasSize(1);
+    }
+
+    private static void setNotificationProvider(boolean available) throws Exception {
+        HttpResponse<String> response = post(notificationService, "/actuator/notificationprovider",
+                "{\"available\":" + available + "}");
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+        assertThat(JSON.readTree(response.body()).get("available").asBoolean()).isEqualTo(available);
+    }
+
+    private static JsonNode notifications(UUID orderId) throws Exception {
+        return JSON.readTree(get(notificationService, "/notifications?orderId=" + orderId));
+    }
+
+    private static JsonNode awaitNotification(UUID orderId, String type) {
+        return await(type + " notification for " + orderId).atMost(DLT_TIMEOUT).pollInterval(Duration.ofMillis(250))
+                .until(() -> {
+                    for (JsonNode n : notifications(orderId)) {
+                        if (n.get("type").asString().equals(type)) {
+                            return n;
+                        }
+                    }
+                    return null;
+                }, n -> n != null);
+    }
+
+    private static UUID outboxMessageId(ServiceProcess service, UUID orderId, String messageType) throws Exception {
+        for (JsonNode m : JSON.readTree(get(service, "/actuator/outbox/" + orderId))) {
+            if (m.get("messageType").asString().equals(messageType)) {
+                return UUID.fromString(m.get("messageId").asString());
+            }
+        }
+        throw new AssertionError("No " + messageType + " in the outbox for " + orderId);
+    }
+
     // ---- security --------------------------------------------------------------------------------
 
     private record Call(ServiceProcess service, String method, String path, String body) {
@@ -695,14 +769,16 @@ class SagaEndToEndIT {
                 new Call(inventoryService, "PUT", "/products/sec-" + UUID.randomUUID(), "{\"availableQuantity\":1}"),
                 new Call(inventoryService, "DELETE", "/products/product-1", null),
                 new Call(shippingService, "GET", "/zones", null),
-                new Call(shippingService, "PUT", "/zones/ZZ", "{\"served\":true}"));
+                new Call(shippingService, "PUT", "/zones/ZZ", "{\"served\":true}"),
+                new Call(notificationService, "GET", "/notifications?limit=1", null),
+                new Call(notificationService, "POST", "/actuator/notificationprovider", "{\"available\":true}"));
         // caller -> expected status for: health, read actuator, list orders, read credit, DLT replay, seed PUT, unlisted,
-        // read zones, change a zone
+        // read zones, change a zone, read notifications, switch the notification provider
         Map<String, List<Integer>> expected = Map.of(
-                "none", List.of(200, 401, 401, 401, 401, 401, 401, 401, 401),
-                "viewer", List.of(200, 200, 200, 200, 403, 403, 403, 200, 403),
-                "operator", List.of(200, 200, 200, 200, 200, 403, 403, 200, 403),
-                "admin", List.of(200, 200, 200, 200, 200, 200, 403, 200, 200));
+                "none", List.of(200, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401),
+                "viewer", List.of(200, 200, 200, 200, 403, 403, 403, 200, 403, 200, 403),
+                "operator", List.of(200, 200, 200, 200, 200, 403, 403, 200, 403, 200, 200),
+                "admin", List.of(200, 200, 200, 200, 200, 200, 403, 200, 200, 200, 200));
         for (var entry : expected.entrySet()) {
             String token = entry.getKey().equals("none") ? null : KEYCLOAK.token(entry.getKey());
             List<Integer> actual = new ArrayList<>();
@@ -900,6 +976,9 @@ class SagaEndToEndIT {
                 .until(() -> paymentReplies(orderId, "PaymentRefunded"), count -> count >= 1);
         assertThat(credit(customer)).isEqualByComparingTo("100.00");
         assertThat(getOrder(orderId).get("sagaState").asString()).isEqualTo("FAILED");
+
+        // Closing the saga by hand still tells the customer, through the same event
+        assertThat(awaitNotification(orderId, "ORDER_REJECTED").get("body").asString()).contains("resolved manually");
 
         JsonNode detail = sagaDetail(sagaId);
         assertThat(detail.get("state").asString()).isEqualTo("FAILED");

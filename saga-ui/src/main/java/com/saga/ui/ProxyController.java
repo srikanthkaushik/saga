@@ -54,7 +54,7 @@ public class ProxyController {
         this.restClient = RestClient.builder().requestFactory(requestFactory).build();
     }
 
-    @RequestMapping("/api/{service:order|payment|inventory|shipping}/**")
+    @RequestMapping("/api/{service:order|payment|inventory|shipping|notification}/**")
     public ResponseEntity<byte[]> proxy(@PathVariable String service,
                                         HttpServletRequest request,
                                         HttpServletResponse response,

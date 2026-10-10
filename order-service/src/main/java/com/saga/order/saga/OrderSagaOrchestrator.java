@@ -49,6 +49,9 @@ import com.saga.order.domain.OrderRepository;
  * Shipping is the pivot: compensatable steps (payment, inventory) come before it and are undone in reverse order
  * when it fails; once a shipment is scheduled the saga completes and nothing is compensated.
  * <p>
+ * Reaching COMPLETED or FAILED also publishes OrderApproved / OrderRejected on order.events (same transaction), for
+ * subscribers such as notification-service that the orchestrator neither knows nor waits for.
+ * <p>
  * Each reply or timeout is handled in one DB transaction covering the state change and the next command
  * (via the outbox). Timeouts compensate unconditionally: a slow participant's late charge or reservation is
  * undone because the compensation command shares its key (orderId) and therefore its partition, so it is
@@ -66,6 +69,7 @@ public class OrderSagaOrchestrator {
     private final OutboxWriter outbox;
     private final SagaTimeoutProperties timeouts;
     private final CompensationMonitor compensationMonitor;
+    private final OrderEventPublisher events;
 
     public OrderSagaOrchestrator(MessageCodec codec,
                                  IdempotencyGuard idempotencyGuard,
@@ -73,7 +77,8 @@ public class OrderSagaOrchestrator {
                                  OrderRepository orderRepository,
                                  OutboxWriter outbox,
                                  SagaTimeoutProperties timeouts,
-                                 CompensationMonitor compensationMonitor) {
+                                 CompensationMonitor compensationMonitor,
+                                 OrderEventPublisher events) {
         this.codec = codec;
         this.idempotencyGuard = idempotencyGuard;
         this.sagaRepository = sagaRepository;
@@ -81,6 +86,7 @@ public class OrderSagaOrchestrator {
         this.outbox = outbox;
         this.timeouts = timeouts;
         this.compensationMonitor = compensationMonitor;
+        this.events = events;
     }
 
     @KafkaListener(topics = Topics.SAGA_REPLIES)
@@ -115,7 +121,7 @@ public class OrderSagaOrchestrator {
             }
             case PaymentFailed f -> {
                 saga.paymentFailed(f.reason());
-                order.reject(f.reason());
+                events.reject(order, f.reason());
             }
             case InventoryReserved r -> {
                 saga.inventoryReserved(now.plus(timeouts.shipping()));
@@ -127,7 +133,7 @@ public class OrderSagaOrchestrator {
             }
             case ShipmentScheduled s -> {
                 saga.shipmentScheduled();
-                order.approve();
+                events.approve(order, s.trackingNumber());
             }
             case ShipmentFailed f -> {
                 saga.shipmentFailed(f.reason(), now.plus(timeouts.compensation()));
@@ -143,7 +149,7 @@ public class OrderSagaOrchestrator {
             }
             case PaymentRefunded r -> {
                 saga.compensated();
-                order.reject(saga.getFailureReason());
+                events.reject(order, saga.getFailureReason());
             }
         }
         log.info("Saga {} for order {} -> {}", saga.getId(), order.getId(), saga.getState());

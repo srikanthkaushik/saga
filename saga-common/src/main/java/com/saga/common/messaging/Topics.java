@@ -8,8 +8,10 @@ public final class Topics {
     public static final String INVENTORY_COMMANDS = "inventory.commands";
     public static final String SHIPPING_COMMANDS = "shipping.commands";
     public static final String SAGA_REPLIES = "order.saga.replies";
+    /** Domain events (OrderApproved, OrderRejected): published by order-service for any subscriber. */
+    public static final String ORDER_EVENTS = "order.events";
 
-    public static final List<String> ALL = List.of(PAYMENT_COMMANDS, INVENTORY_COMMANDS, SHIPPING_COMMANDS, SAGA_REPLIES);
+    public static final List<String> ALL = List.of(PAYMENT_COMMANDS, INVENTORY_COMMANDS, SHIPPING_COMMANDS, SAGA_REPLIES, ORDER_EVENTS);
 
     /** Spring Kafka's DeadLetterPublishingRecoverer default suffix. */
     public static final String DLT_SUFFIX = "-dlt";

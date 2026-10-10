@@ -1,15 +1,17 @@
 'use strict';
 
 /*
- * Saga console. Talks to the services through the saga-ui proxy (/api/{order|payment|inventory|shipping}/...) and to
+ * Saga console. Talks to the services through the saga-ui proxy (/api/{order|payment|inventory|shipping|notification}/...) and to
  * saga-ui itself for message injection (/api/inject). All server data is rendered via textContent / DOM nodes.
  */
 
-const SERVICES = ['order', 'payment', 'inventory', 'shipping'];
-const LANE = { order: 1, payment: 2, inventory: 3, shipping: 4 };
+const SERVICES = ['order', 'payment', 'inventory', 'shipping', 'notification'];
+const LANE = { order: 1, payment: 2, inventory: 3, shipping: 4, notification: 5 };
 const TOPIC_TARGET = {
     'payment.commands': 'payment', 'inventory.commands': 'inventory', 'shipping.commands': 'shipping', 'order.saga.replies': 'order',
 };
+/* Domain events: published for whoever subscribes (notification-service today); nobody replies to them. */
+const EVENT_TOPIC = 'order.events';
 const POLL_MS = 1500;
 
 const state = {
@@ -168,6 +170,7 @@ function applyRoleGates() {
     gate(document.querySelectorAll('#customer-form button, #product-form button, #zone-form button'), ROLE.admin);
     gate(document.querySelectorAll('#intervene-form button'), ROLE.operator);
     gate(document.querySelectorAll('#inject-form button, #presets button'), ROLE.operator);
+    gate(document.querySelectorAll('#provider-toggle'), ROLE.operator);
     const notes = [
         ['#scenario-roles', ROLE.admin, 'Scenarios create customers and products, which needs the saga-admin role. You can still place orders for existing customers below.'],
         ['#intervene-roles', ROLE.operator, 'Retry and resolve need the saga-operator role.'],
@@ -452,7 +455,7 @@ async function refreshDetail() {
     const order = orderResult.data;
     state.sagaId = order.sagaId;
 
-    const [outOrder, outPayment, outInventory, outShipping, payment, reservation, shipment, customer, product, saga] = await Promise.all([
+    const [outOrder, outPayment, outInventory, outShipping, payment, reservation, shipment, customer, product, saga, notes] = await Promise.all([
         get('order', `/actuator/outbox/${id}`),
         get('payment', `/actuator/outbox/${id}`),
         get('inventory', `/actuator/outbox/${id}`),
@@ -463,6 +466,7 @@ async function refreshDetail() {
         get('payment', `/customers/${encodeURIComponent(order.customerId)}`),
         get('inventory', `/products/${encodeURIComponent(order.productId)}`),
         get('order', `/actuator/stucksagas/${order.sagaId}`),
+        get('notification', `/notifications?orderId=${id}`),
     ]);
     if (state.orderId !== id) return;
 
@@ -473,14 +477,16 @@ async function refreshDetail() {
         ...(outShipping.ok ? outShipping.data.map((m) => ({ ...m, service: 'shipping' })) : []),
     ].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
     const sagaDetail = saga.ok ? saga.data : null;
+    const notifications = notes.ok ? notes.data : [];
 
     $('#detail-empty').hidden = true;
     $('#detail-body').hidden = false;
     renderHeader(order);
     renderMap(order, messages);
-    renderTimeline(order, messages, sagaDetail);
+    renderTimeline(order, messages, sagaDetail, notifications);
     renderSaga(order, sagaDetail);
     renderParticipants(order, payment, reservation, shipment, customer, product);
+    renderNotifications(order, notes, notifications);
 }
 
 function renderHeader(order) {
@@ -511,20 +517,21 @@ const STATIONS = {
 const NODE_W = 160;
 const NODE_H = 42;
 
-/* Labels: top row above its track, bottom row below its track, verticals and diagonals to their left. */
+/* Labels: top row above the boxes, bottom row below them (the gaps between boxes are too narrow for a label), verticals and
+   diagonals to their left. */
 const TRACKS = [
-    { from: 'PAYMENT_PENDING', to: 'INVENTORY_PENDING', kind: 'fwd', label: 'PaymentProcessed', lx: 0, ly: -10 },
-    { from: 'INVENTORY_PENDING', to: 'SHIPPING_PENDING', kind: 'fwd', label: 'InventoryReserved', lx: 0, ly: -10 },
-    { from: 'SHIPPING_PENDING', to: 'COMPLETED', kind: 'fwd', label: 'ShipmentScheduled', lx: 0, ly: -10 },
+    { from: 'PAYMENT_PENDING', to: 'INVENTORY_PENDING', kind: 'fwd', label: 'PaymentProcessed', lx: 0, ly: -26 },
+    { from: 'INVENTORY_PENDING', to: 'SHIPPING_PENDING', kind: 'fwd', label: 'InventoryReserved', lx: 0, ly: -26 },
+    { from: 'SHIPPING_PENDING', to: 'COMPLETED', kind: 'fwd', label: 'ShipmentScheduled', lx: 0, ly: -26 },
     { from: 'PAYMENT_PENDING', to: 'FAILED', kind: 'fwd', label: 'PaymentFailed', lx: -10, ly: 4, anchor: 'end' },
     { from: 'PAYMENT_PENDING', to: 'COMPENSATING', kind: 'comp', label: 'payment timeout', lx: -12, ly: 4, anchor: 'end' },
     { from: 'INVENTORY_PENDING', to: 'COMPENSATING', kind: 'comp', label: 'InventoryFailed', lx: -10, ly: 4, anchor: 'end' },
     { from: 'INVENTORY_PENDING', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'inventory timeout', lx: -12, ly: 4, anchor: 'end' },
     { from: 'SHIPPING_PENDING', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'ShipmentFailed', lx: -10, ly: 4, anchor: 'end' },
     { from: 'SHIPPING_PENDING', to: 'CANCELLING_SHIPMENT', kind: 'comp', label: 'shipping timeout', lx: -12, ly: 4, anchor: 'end' },
-    { from: 'CANCELLING_SHIPMENT', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'ShipmentCancelled', lx: 0, ly: 18 },
-    { from: 'RELEASING_INVENTORY', to: 'COMPENSATING', kind: 'comp', label: 'InventoryReleased', lx: 0, ly: 18 },
-    { from: 'COMPENSATING', to: 'FAILED', kind: 'comp', label: 'PaymentRefunded', lx: 0, ly: 18 },
+    { from: 'CANCELLING_SHIPMENT', to: 'RELEASING_INVENTORY', kind: 'comp', label: 'ShipmentCancelled', lx: 0, ly: 34 },
+    { from: 'RELEASING_INVENTORY', to: 'COMPENSATING', kind: 'comp', label: 'InventoryReleased', lx: 0, ly: 34 },
+    { from: 'COMPENSATING', to: 'FAILED', kind: 'comp', label: 'PaymentRefunded', lx: 0, ly: 34 },
 ];
 
 /** Replays the order's commands to reconstruct the states it passed through. */
@@ -614,14 +621,25 @@ const COMPENSATION_TYPES = new Set([
 const FAILURE_TYPES = new Set(['PaymentFailed', 'InventoryFailed', 'ShipmentFailed']);
 
 function messageKind(type) {
+    if (type === 'OrderApproved' || type === 'OrderRejected') return 'event';
     if (COMPENSATION_TYPES.has(type)) return 'comp';
     if (FAILURE_TYPES.has(type)) return 'fail';
     if (type === 'ShipmentScheduled') return 'ok';
     return '';
 }
 
-function renderTimeline(order, messages, sagaDetail) {
+function renderTimeline(order, messages, sagaDetail, notifications) {
     const rows = messages.map((m) => ({ at: m.createdAt, lane: m.service, node: messageNode(m) }));
+    for (const n of notifications) {
+        rows.push({
+            at: n.sentAt,
+            lane: 'notification',
+            node: h('details', { class: 'msg sent', 'data-id': n.id },
+                h('summary', { text: `${human(n.channel)} sent` }),
+                h('span', { class: 'to', text: `to ${n.recipient}` }),
+                h('pre', { text: `${n.subject}\n\n${n.body}` })),
+        });
+    }
     for (const i of (sagaDetail && sagaDetail.interventions) || []) {
         rows.push({
             at: i.at,
@@ -645,7 +663,7 @@ function renderTimeline(order, messages, sagaDetail) {
 }
 
 function messageNode(m) {
-    const target = TOPIC_TARGET[m.topic];
+    const target = m.topic === EVENT_TOPIC ? `subscribers of ${EVENT_TOPIC}` : TOPIC_TARGET[m.topic];
     const where = m.publishedAt ? `to ${target}` : `to ${target}, waiting in outbox`;
     return h('details', { class: `msg ${messageKind(m.messageType)}`, 'data-id': m.messageId },
         h('summary', { text: m.messageType }),
@@ -690,6 +708,20 @@ function renderParticipants(order, payment, reservation, shipment, customer, pro
     ]);
 }
 
+function renderNotifications(order, result, notifications) {
+    const expected = order.status === 'APPROVED' ? 'ORDER_APPROVED' : order.status === 'REJECTED' ? 'ORDER_REJECTED' : null;
+    let told = 'not yet: the order is still running';
+    if (!result.ok) told = 'unavailable';
+    else if (notifications.some((n) => n.type === expected)) told = badge('SENT');
+    else if (expected) told = 'not yet: waiting for the event, retrying, or dead-lettered';
+    const last = notifications[notifications.length - 1];
+    facts($('#notification-facts'), [
+        ['Customer told', told],
+        ['Message', last ? last.subject : '–'],
+        ['Sent', last ? ago(last.sentAt) : '–'],
+    ]);
+}
+
 async function intervene(event) {
     event.preventDefault();
     const form = event.target;
@@ -718,11 +750,13 @@ const METRICS = [
 ];
 
 async function refreshOps() {
-    const [metricResults, stuck, dlts] = await Promise.all([
+    const [metricResults, stuck, dlts, provider] = await Promise.all([
         Promise.all(METRICS.map((m) => get('order', `/actuator/metrics/${m.name}`))),
         get('order', '/actuator/stucksagas'),
         Promise.all(SERVICES.map((s) => get(s, '/actuator/dlt'))),
+        get('notification', '/actuator/notificationprovider'),
     ]);
+    renderProvider(provider);
 
     $('#tiles').replaceChildren(...METRICS.map((m, i) => {
         const r = metricResults[i];
@@ -749,6 +783,35 @@ async function refreshOps() {
     }
 
     renderDlts(dlts);
+}
+
+/** The simulated e-mail gateway: switch it off to watch order events retry, dead-letter and get replayed. */
+function renderProvider(result) {
+    const status = $('#provider-status');
+    const button = $('#provider-toggle');
+    if (!result.ok) {
+        status.replaceChildren(`Unavailable: ${errorText(result)}`);
+        button.hidden = true;
+        return;
+    }
+    const p = result.data;
+    status.replaceChildren(
+        h('span', { class: `badge ${p.available ? 'SERVED' : 'UNSERVED'}`, text: p.available ? 'sending' : 'down' }),
+        ` ${p.sent} sent, ${p.refused} refused since notification-service started.`);
+    button.hidden = false;
+    button.textContent = p.available ? 'Take the provider down' : 'Bring the provider back';
+    button.dataset.next = String(!p.available);
+}
+
+async function toggleProvider() {
+    const button = $('#provider-toggle');
+    const error = $('#provider-error');
+    error.textContent = '';
+    button.disabled = true;
+    const result = await call('notification', 'POST', '/actuator/notificationprovider', { available: button.dataset.next === 'true' });
+    button.disabled = !can(ROLE.operator);
+    if (!result.ok) error.textContent = errorText(result);
+    once('ops', refreshOps);
 }
 
 const dltCards = new Map();
@@ -974,6 +1037,16 @@ const CATALOGUE = {
         ['POST', '/actuator/dlt/shipping.commands', 'Replay dead-lettered commands', { limit: 100 }],
         ['GET', '/actuator/health', 'Health'],
     ],
+    notification: [
+        ['GET', '/notifications?limit=20', 'Recent notifications'],
+        ['GET', '/notifications?orderId={orderId}', 'Notifications for an order'],
+        ['GET', '/actuator/notificationprovider', 'Provider status'],
+        ['POST', '/actuator/notificationprovider', 'Take the provider down', { available: false }],
+        ['POST', '/actuator/notificationprovider', 'Bring the provider back', { available: true }],
+        ['GET', '/actuator/dlt', 'Dead-letter topics'],
+        ['POST', '/actuator/dlt/order.events', 'Replay dead-lettered events', { limit: 100 }],
+        ['GET', '/actuator/health', 'Health'],
+    ],
     ui: [
         ['POST', '/api/inject', 'Publish a raw message', { topic: 'payment.commands', messageType: 'NoSuchCommand', payload: '{"foo":1}' }],
         ['GET', '/actuator/health', 'Console health'],
@@ -981,7 +1054,8 @@ const CATALOGUE = {
 };
 
 const SERVICE_LABEL = {
-    order: 'order-service', payment: 'payment-service', inventory: 'inventory-service', shipping: 'shipping-service', ui: 'This console',
+    order: 'order-service', payment: 'payment-service', inventory: 'inventory-service', shipping: 'shipping-service',
+    notification: 'notification-service', ui: 'This console',
 };
 
 function renderCatalogue() {
@@ -1055,6 +1129,7 @@ async function init() {
     $('#customer-form').addEventListener('submit', saveData('payment', 'customers', 'availableCredit', '#customer-error'));
     $('#product-form').addEventListener('submit', saveData('inventory', 'products', 'availableQuantity', '#product-error'));
     $('#console-form').addEventListener('submit', sendConsole);
+    $('#provider-toggle').addEventListener('click', toggleProvider);
 
     renderScenarios();
     renderPresets();

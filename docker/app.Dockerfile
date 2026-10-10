@@ -1,4 +1,4 @@
-# Runtime image for one Spring Boot module (order-service, payment-service, inventory-service, shipping-service, saga-ui).
+# Runtime image for one Spring Boot module (order-service, payment-service, inventory-service, shipping-service, notification-service, saga-ui).
 # Build from the repository root after `mvn package` (ops\images.cmd does both):
 #   docker build -f docker/app.Dockerfile --build-arg MODULE=order-service -t ghcr.io/srikanthkaushik/saga-order-service .
 

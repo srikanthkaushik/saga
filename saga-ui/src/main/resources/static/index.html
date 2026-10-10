@@ -88,7 +88,7 @@
                 <div class="split">
                     <section>
                         <h3>Messages</h3>
-                        <div class="lanes-head"><span></span><span>order</span><span>payment</span><span>inventory</span><span>shipping</span></div>
+                        <div class="lanes-head"><span></span><span>order</span><span>payment</span><span>inventory</span><span>shipping</span><span>notification</span></div>
                         <ol class="timeline" id="timeline"></ol>
                     </section>
                     <section class="side">
@@ -115,6 +115,8 @@
                         <dl class="facts" id="inventory-facts"></dl>
                         <h3>Shipping</h3>
                         <dl class="facts" id="shipping-facts"></dl>
+                        <h3>Notification</h3>
+                        <dl class="facts" id="notification-facts"></dl>
                     </section>
                 </div>
             </div>
@@ -133,6 +135,14 @@
             <h2>Stuck sagas</h2>
             <p class="hint">Sagas whose refund or release keeps being re-sent without a reply. Open one to retry or resolve it.</p>
             <table class="grid" id="stuck"></table>
+        </section>
+
+        <section class="block">
+            <h2>Notification provider</h2>
+            <p class="hint">The simulated e-mail gateway behind notification-service. Take it down, place an order: the order still completes, but its event is retried and then dead-lettered under order.events below. Bring it back and replay: the customer is told exactly once.</p>
+            <p id="provider-status"></p>
+            <button type="button" id="provider-toggle" hidden></button>
+            <p class="error" id="provider-error" aria-live="polite"></p>
         </section>
 
         <section class="block">
@@ -155,6 +165,7 @@
                                 <option>inventory.commands</option>
                                 <option>shipping.commands</option>
                                 <option>order.saga.replies</option>
+                                <option>order.events</option>
                             </select>
                         </label>
                         <label>Message type <input name="messageType" required list="message-types"></label>
@@ -166,6 +177,7 @@
                         <option>InventoryReserved</option><option>InventoryFailed</option><option>InventoryReleased</option>
                         <option>ScheduleShipment</option><option>CancelShipment</option>
                         <option>ShipmentScheduled</option><option>ShipmentFailed</option><option>ShipmentCancelled</option>
+                        <option>OrderApproved</option><option>OrderRejected</option>
                     </datalist>
                     <div class="row3">
                         <label>Key <input name="key" placeholder="random"></label>
@@ -237,6 +249,7 @@
                             <option value="payment">payment</option>
                             <option value="inventory">inventory</option>
                             <option value="shipping">shipping</option>
+                            <option value="notification">notification</option>
                             <option value="ui">console</option>
                         </select>
                         <select name="method" aria-label="Method">

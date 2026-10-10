@@ -18,7 +18,7 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * Serializes saga messages to JSON and resolves them back by the simple type name carried in the
  * {@code messageType} header. The registry is derived from the sealed hierarchies, so adding a
- * record to {@link SagaCommand} or {@link SagaReply} registers it automatically.
+ * record to {@link SagaCommand}, {@link SagaReply} or {@link OrderEvent} registers it automatically.
  */
 @Component
 public class MessageCodec {
@@ -28,9 +28,8 @@ public class MessageCodec {
 
     public MessageCodec(JsonMapper jsonMapper) {
         this.jsonMapper = jsonMapper;
-        this.types = Stream.concat(
-                        Arrays.stream(SagaCommand.class.getPermittedSubclasses()),
-                        Arrays.stream(SagaReply.class.getPermittedSubclasses()))
+        this.types = Stream.of(SagaCommand.class, SagaReply.class, OrderEvent.class)
+                .flatMap(sealed -> Arrays.stream(sealed.getPermittedSubclasses()))
                 .collect(Collectors.toUnmodifiableMap(Class::getSimpleName, Function.identity()));
     }
 
