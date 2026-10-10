@@ -113,6 +113,20 @@ main { padding: 1.25rem 1.5rem 3rem; }
 .block { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md); padding: 1rem 1.1rem; }
 .block + .block, .two + .block, .block + .two { margin-top: 1rem; }
 
+/* Collapsible panels (native <details>): the heading is the toggle, with a chevron that turns when open */
+.collapsible > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: .5rem; border-radius: var(--r-sm); }
+.collapsible > summary::-webkit-details-marker { display: none; }
+.collapsible > summary h2 { margin: 0; }
+.collapsible > summary::after {
+    content: ""; margin-left: auto; width: .5rem; height: .5rem;
+    border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted);
+    transform: rotate(-45deg); transition: transform .15s ease;
+}
+.collapsible[open] > summary { margin-bottom: .5rem; }
+.collapsible[open] > summary::after { transform: rotate(45deg); }
+.collapsible > summary:hover h2 { color: var(--fwd); }
+@media (prefers-reduced-motion: reduce) { .collapsible > summary::after { transition: none; } }
+
 .hint { color: var(--muted); font-size: .85rem; margin: 0 0 .75rem; max-width: 70ch; }
 .note { font-size: .85rem; margin: .5rem 0 0; min-height: 1.2em; }
 .error { color: var(--fail); font-size: .85rem; margin: .25rem 0 0; min-height: 1.2em; }
@@ -169,7 +183,10 @@ button.danger { color: var(--fail); border-color: var(--fail); }
 
 #tab-saga:not([hidden]) { display: grid; grid-template-columns: 340px 1fr; gap: 1.25rem; align-items: start; }
 
-.rail { display: grid; gap: 1rem; position: sticky; top: 4.5rem; }
+/* The rail fills the window height; Recent orders takes whatever the (collapsible) panels above leave free */
+.rail { display: flex; flex-direction: column; gap: 1rem; position: sticky; top: 4.5rem; max-height: calc(100vh - 5.75rem); overflow-y: auto; }
+.rail > .block { margin-top: 0; flex: 0 0 auto; }
+.rail > .block.grow { flex: 1 1 auto; min-height: 24rem; display: flex; flex-direction: column; }
 
 .scenarios { display: grid; gap: .4rem; }
 .scenario {
@@ -181,7 +198,7 @@ button.danger { color: var(--fail); border-color: var(--fail); }
 .scenario strong { font-weight: 600; font-size: .9rem; }
 .scenario span { color: var(--muted); font-size: .8rem; }
 
-.orders { list-style: none; margin: 0; padding: 0; max-height: 40vh; overflow: auto; }
+.orders { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1 1 auto; min-height: 0; }
 .orders li button {
     width: 100%; border: 0; border-bottom: 1px solid var(--line); border-radius: 0;
     background: none; padding: .45rem .25rem; display: grid;
@@ -299,7 +316,8 @@ button.danger { color: var(--fail); border-color: var(--fail); }
 
 @media (max-width: 1100px) {
     #tab-saga:not([hidden]) { grid-template-columns: 1fr; }
-    .rail { position: static; }
+    .rail { position: static; max-height: none; }
+    .orders { max-height: 50vh; }
     .split, .two, .console { grid-template-columns: 1fr; }
     .catalogue { position: static; max-height: 40vh; }
 }

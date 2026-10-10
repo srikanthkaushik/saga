@@ -352,8 +352,10 @@ async function loadOrderOptions() {
     fillOptions($('#customer-options'), known.customers || []);
     fillOptions($('#product-options'), known.products || []);
     const form = $('#order-form');
-    if (!form.customerId.value && known.customers && known.customers.length) form.customerId.value = known.customers[0][0];
-    if (!form.productId.value && known.products && known.products.length) form.productId.value = known.products[0][0];
+    // Prefer the seed data over whatever scenario customer/product happens to sort first
+    const pick = (list, preferred) => (list.some(([value]) => value === preferred) ? preferred : list[0][0]);
+    if (!form.customerId.value && known.customers && known.customers.length) form.customerId.value = pick(known.customers, 'customer-1');
+    if (!form.productId.value && known.products && known.products.length) form.productId.value = pick(known.products, 'product-1');
     $('#order-options-note').textContent = notes.length
         ? `${notes.join('; ')}. You can still type an id (e.g. customer-1, product-1) and place the order.`
         : '';
@@ -948,7 +950,22 @@ async function sendConsole(event) {
 
 /* ------------------------------------------------------------------ start */
 
+/** Collapsible panels remember whether they were open (per browser). */
+function rememberPanels() {
+    for (const panel of document.querySelectorAll('details.collapsible')) {
+        const key = `saga-console-panel-${panel.id}`;
+        try {
+            const saved = localStorage.getItem(key);
+            if (saved !== null) panel.open = saved === 'open';
+        } catch { /* storage unavailable: keep the default */ }
+        panel.addEventListener('toggle', () => {
+            try { localStorage.setItem(key, panel.open ? 'open' : 'closed'); } catch { /* storage unavailable */ }
+        });
+    }
+}
+
 async function init() {
+    rememberPanels();
     await loadMe();
     document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab)));
     $('#order-form').addEventListener('submit', placeOrder);

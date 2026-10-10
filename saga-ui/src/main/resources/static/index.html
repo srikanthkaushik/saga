@@ -26,16 +26,16 @@
     <!-- Saga --------------------------------------------------------------------------------------->
     <section class="tab" id="tab-saga">
         <aside class="rail">
-            <section class="block">
-                <h2>Run a scenario</h2>
+            <details class="block collapsible" id="panel-scenarios" open>
+                <summary><h2>Run a scenario</h2></summary>
                 <p class="hint">Each scenario creates a fresh customer and product, then places the order.</p>
                 <p class="role-note" id="scenario-roles" hidden></p>
                 <div class="scenarios" id="scenarios"></div>
                 <p class="note" id="scenario-note" aria-live="polite"></p>
-            </section>
+            </details>
 
-            <section class="block">
-                <h2>Place an order</h2>
+            <details class="block collapsible" id="panel-place-order" open>
+                <summary><h2>Place an order</h2></summary>
                 <form id="order-form" class="form">
                     <label>Customer <input name="customerId" list="customer-options" required autocomplete="off" spellcheck="false" placeholder="customer-1"></label>
                     <datalist id="customer-options"></datalist>
@@ -49,7 +49,7 @@
                     <button type="submit" class="primary">Place order</button>
                     <p class="error" id="order-error" aria-live="polite"></p>
                 </form>
-            </section>
+            </details>
 
             <section class="block grow">
                 <h2>Recent orders</h2>
