@@ -10,7 +10,7 @@ This project is a working, tested implementation of that pattern, including the 
 - **Timeouts:** a participant that never answers doesn't hang an order.
 - **Fencing:** late messages can't charge, reserve or ship for an order that was already cancelled.
 - **Compensatable, pivot and retriable steps:** payment and stock are undone in reverse order when shipping fails; notifications after the pivot only retry.
-- **Orchestration and choreography side by side:** the orchestrator drives the saga with commands; notification-service reacts to domain events nobody waits for.
+- **Orchestration and choreography side by side:** the orchestrator drives the saga with commands; notification-service reacts to domain events nobody waits for ([what each is, and where each is used](docs/ARCHITECTURE.md#orchestration-and-choreography)).
 - **Alerting and manual resolution** for compensations that keep failing.
 - **OAuth2/JWT security with Keycloak**: roles for viewers, operators and admins, and audit records of who did what.
 - **A browser console** that shows each saga live and can call every endpoint.

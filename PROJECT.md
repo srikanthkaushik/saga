@@ -325,6 +325,7 @@ curl http://localhost:8081/orders/<id>
   - That browser check is a one-off script and is **not** in the repo.
 
 - [x] 2026-10-10: **shipping-service** (pivot, reverse-order compensation, CANCELLING_SHIPMENT, zones, fencing) and **notification-service** (order events on `order.events`, choreography, retriable step with provider outage, exactly-once notification). Console: 4×2 map, five lanes, destination, zones, provider switch, Unshippable destination scenario. 33 e2e tests green; headless-Chrome check of every new view; manual outage check (shipping-service stopped mid-saga → CANCELLING_SHIPMENT → restart → late shipment cancelled, stock and credit restored, customer notified).
+- [x] 2026-10-12: Architecture guide explains orchestration vs choreography: what each is, a comparison, where each is used here (saga commands and replies vs `order.events`), why, the outbox hand-over between them, how to see it in the console, and which style a new service should use.
 
 ## Next / open
 - [ ] **Production identity setup:**

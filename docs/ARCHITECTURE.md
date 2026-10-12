@@ -3,6 +3,7 @@
 This document explains **what** the system does, **why** it is built this way, and **which code** implements each part. For hands-on exploration, pair it with [Scenarios](SCENARIOS.md). For a class-by-class tour, see [Codebase](CODEBASE.md).
 
 - [1. The problem a saga solves](#1-the-problem-a-saga-solves)
+  - [Orchestration and choreography](#orchestration-and-choreography)
 - [2. System overview](#2-system-overview)
 - [3. The happy path, message by message](#3-the-happy-path-message-by-message)
 - [4. The saga state machine](#4-the-saga-state-machine)
@@ -44,14 +45,97 @@ Not every step can be undone, so a saga orders its steps by what can go wrong:
 
 So when shipping refuses an order, the saga first releases the stock, then refunds the payment: the last thing done is the first undone.
 
-### Orchestration rather than choreography
-There are two ways to coordinate a saga:
-- **Choreography:** each service reacts to the others' events. There's no central brain, so the flow is implicit and spread across services.
-- **Orchestration** (used here): one component, the **orchestrator** in order-service, holds the saga state and tells each participant what to do with **commands**. Participants answer with **replies**.
+### Orchestration and choreography
+Something has to coordinate a saga's steps. Something must decide that stock is reserved once the payment has gone through, and that when shipping refuses, the stock is released first and the payment refunded after. There are two ways to do that, and this application uses both, each where it fits.
 
-Orchestration keeps the whole flow in one place (`OrderSagaOrchestrator`), so it's easy to read, test and extend. Timeouts and operator interventions also have an obvious home. Payment, inventory and shipping stay simple: they know nothing about each other or about sagas.
+**Orchestration: one service directs.** A central **orchestrator** holds the saga's state and tells each participant what to do. It sends **commands**: imperative messages addressed to exactly one service ("charge this customer", "reserve this stock"). Then it waits for that service's **reply**. The participants don't know they're in a saga. Each one does its job and reports back, like musicians following a conductor.
 
-**Choreography where it fits.** What happens *after* the outcome isn't part of the saga: nothing waits for it and nothing can undo it. So order-service publishes **domain events** (`OrderApproved`, `OrderRejected`) on `order.events`, and notification-service subscribes on its own. The orchestrator doesn't know it exists; more subscribers (invoicing, analytics) could be added without touching order-service. The events go through the outbox in the same transaction that decides the outcome, so an event exists exactly when the outcome does.
+**Choreography: services react to each other.** Nobody is in charge. A service publishes **events**: past-tense facts about something that has already happened ("order approved"). Any service that cares subscribes and reacts, and may publish events of its own. The flow is the sum of those reactions, like dancers who each know their cue.
+
+| | Orchestration | Choreography |
+|---|---|---|
+| Message | a command, "do X", to one recipient; a reply comes back | an event, "X happened", to anyone listening; no reply |
+| Where the flow lives | in the orchestrator, in one place | nowhere; it's spread across the subscribers |
+| Coupling | the orchestrator knows each participant's commands; participants know nothing of each other | the publisher knows nothing of its subscribers; subscribers depend only on the event's shape |
+| Adding a step | change the orchestrator | add a subscriber; the publisher doesn't change |
+| Failures, timeouts, undo | the orchestrator notices and decides what to do | each service handles its own part; nobody sees the whole picture |
+| Best for | steps that must happen in order, can fail the whole thing, or may need undoing | side effects that follow a final fact and can't change it |
+
+#### Where each style is used
+```mermaid
+flowchart LR
+    subgraph orchestration["Orchestration: the saga"]
+        order["order-service<br/>OrderSagaOrchestrator"]
+        payment[payment-service]
+        inventory[inventory-service]
+        shipping[shipping-service]
+        order -->|"ProcessPayment, RefundPayment<br/>payment.commands"| payment
+        order -->|"ReserveInventory, ReleaseInventory<br/>inventory.commands"| inventory
+        order -->|"ScheduleShipment, CancelShipment<br/>shipping.commands"| shipping
+        payment -->|"replies<br/>order.saga.replies"| order
+        inventory -->|replies| order
+        shipping -->|replies| order
+    end
+    subgraph choreography["Choreography: after the outcome"]
+        events(["order.events"])
+        notification[notification-service]
+        future["more subscribers later<br/>(invoicing, analytics…)"]
+        events -.-> notification
+        events -.-> future
+    end
+    order -.->|"OrderApproved, OrderRejected"| events
+```
+
+| What happens | Style | Messages and topics | Code |
+|---|---|---|---|
+| Charge, reserve, ship; on failure, undo in reverse order | orchestration | commands on `payment.commands`, `inventory.commands` and `shipping.commands`; replies on `order.saga.replies` | [`OrderSagaOrchestrator`](../order-service/src/main/java/com/saga/order/saga/OrderSagaOrchestrator.java) sends every command and handles every reply in `onReply`. Each participant's `*CommandHandler` does the work and replies |
+| A participant doesn't answer in time | orchestration | the compensating command, re-sent until it's answered | [`SagaTimeoutScanner`](../order-service/src/main/java/com/saga/order/saga/SagaTimeoutScanner.java) calls `OrderSagaOrchestrator.onTimeout` |
+| An operator retries or resolves a stuck saga | orchestration | the same commands | [`SagaInterventionService`](../order-service/src/main/java/com/saga/order/saga/intervention/SagaInterventionService.java) |
+| The customer is told how the order ended | choreography | `OrderApproved` / `OrderRejected` on `order.events` | published by [`OrderEventPublisher`](../order-service/src/main/java/com/saga/order/saga/OrderEventPublisher.java); consumed by [`NotificationHandler`](../notification-service/src/main/java/com/saga/notification/NotificationHandler.java) |
+
+#### Why the saga itself is orchestrated
+Picture the same saga choreographed:
+- payment-service charges when it hears `OrderCreated`;
+- inventory-service reserves when it hears `PaymentProcessed`;
+- shipping-service schedules when it hears `InventoryReserved`.
+
+So far that's simple. Now shipping fails:
+- inventory-service must listen for `ShipmentFailed` and release the stock;
+- payment-service must listen for `InventoryReleased` and refund, but only when the release followed a shipping failure, not when it came from somewhere else;
+- order-service must listen to all of it to work out whether the order ended approved or rejected.
+
+The rule "undo in reverse order" would be split across three services, and a timeout would have no owner: who notices that shipping never answered?
+
+Orchestrated, all of it is in one class:
+- the exhaustive `switch` in `onReply` lists every reply and what follows it;
+- `expectedState` drops replies that arrive late or out of order;
+- a deadline on each saga row means a missing reply always gets noticed.
+
+The participants stay simple and know nothing about orders' outcomes. payment-service would serve a `ProcessPayment` from any saga the same way.
+
+**The price:** order-service is central, and it must know each participant's command format. If it's down, sagas pause: their state is in `order_saga`, so they carry on when it's back. Nothing is lost.
+
+#### Why notifications are choreographed
+After the pivot the outcome is fixed. Telling the customer can't change it, nothing waits for it, and nothing undoes it. Putting it in the orchestrator would add a step that's never allowed to fail, and keep the order out of COMPLETED while an e-mail is sent. As an event instead:
+- **order-service doesn't know notification-service exists.** It has no command, reply, state or timeout for it.
+- **A notification outage never touches an order.** The messages retry, land in `order.events-dlt`, and are replayed when the gateway is back ([Scenario 17](SCENARIOS.md#scenario-17--notification-outage-and-replay)).
+- **More subscribers cost nothing.** Each service consumes in its own consumer group, named after the application, so each one gets every event independently. Invoicing or analytics could subscribe tomorrow without a change to order-service.
+
+**The price:** no single place answers "has the customer been told?"; you ask notification-service (`GET /notifications?orderId=`). Every subscriber must also cope with at-least-once delivery. notification-service does this with `processed_message` and a unique `(order_id, type)`.
+
+#### Where the two meet
+The orchestrator's last act is the hand-over. When the saga reaches an outcome, `OrderEventPublisher` approves or rejects the order **and** writes the event to the outbox, in the same transaction. That covers every way a saga can end: a final reply, the end of a compensation chain, or an operator's resolve. So the event exists exactly when the outcome does: never an event for an order that wasn't decided, never a decided order without its event. Choreography starts exactly where orchestration ends.
+
+#### Seeing it in the console
+In an order's message timeline:
+- **Commands and replies** have a solid edge and travel between order-service and one named participant.
+- **`OrderApproved` / `OrderRejected`** has a **dashed** edge and is addressed to "subscribers of order.events". The notification then appears in the fifth lane.
+
+In AKHQ, `order.events` shows one consumer group per subscriber.
+
+#### Adding a service: which style?
+- **The order's outcome depends on it, or it might need undoing:** it's a saga step. Add a command and reply to `SagaCommand` / `SagaReply`, and a state and its transitions in the orchestrator ([Codebase: add a saga step](CODEBASE.md#add-a-saga-step)).
+- **It only reacts to the outcome:** subscribe to `order.events`. Make the handler idempotent; order-service needs no change ([Codebase: add an event subscriber](CODEBASE.md#add-an-event-subscriber)).
 
 ---
 
