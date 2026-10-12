@@ -326,6 +326,40 @@ curl http://localhost:8081/orders/<id>
 
 - [x] 2026-10-10: **shipping-service** (pivot, reverse-order compensation, CANCELLING_SHIPMENT, zones, fencing) and **notification-service** (order events on `order.events`, choreography, retriable step with provider outage, exactly-once notification). Console: 4×2 map, five lanes, destination, zones, provider switch, Unshippable destination scenario. 33 e2e tests green; headless-Chrome check of every new view; manual outage check (shipping-service stopped mid-saga → CANCELLING_SHIPMENT → restart → late shipment cancelled, stock and credit restored, customer notified).
 - [x] 2026-10-12: Architecture guide explains orchestration vs choreography: what each is, a comparison, where each is used here (saga commands and replies vs `order.events`), why, the outbox hand-over between them, how to see it in the console, and which style a new service should use.
+- [x] 2026-10-12: recorded the RESTEasy/JAX-RS port analysis (see "Evaluated: porting off Spring Boot").
+
+## Evaluated: porting off Spring Boot (RESTEasy / JAX-RS), 2026-10-12
+
+**Question:** could the whole application use RESTEasy (JAX-RS) instead of Spring Boot?
+
+**Verdict:** possible, but a full rewrite with no functional gain. RESTEasy replaces only the REST layer. Most of what Spring Boot does here isn't REST, and the real cost is in the Kafka retry/dead-letter handling and security. **Spring Boot 4.0.6 stays the canonical stack** (CLAUDE.md).
+
+- **Namespace:** `javax.ws.rs` is end-of-life (RESTEasy 3.x/4.x, before Jakarta EE 9). A Java 21 port would use `jakarta.ws.rs` (RESTEasy 6.2/7.x).
+- **Measured coupling:** 57 of the 89 main classes import Spring. The heaviest areas are web binding, Spring Data JPA, `@Transactional`, actuator and security.
+
+| Spring feature used here | Replacement | Effort |
+|---|---|---|
+| `@RestController`, request mapping, validation | JAX-RS resources + Bean Validation | Mechanical |
+| Spring Data JPA repositories, entities | Hibernate / Jakarta Persistence directly; repositories by hand (or Jakarta Data / Panache) | Moderate |
+| `@Transactional`, incl. `MANDATORY` (outbox written in the caller's transaction, `OrderEventPublisher`) | Jakarta Transactions `@Transactional(TxType.MANDATORY)`; needs a CDI container | Easy in a container, hard without |
+| Spring Kafka: `@KafkaListener`, blocking retry with backoff, dead-letter publishing, `KafkaListenerEndpointRegistry` (the pause/replay behind `DltEndpoint`) | SmallRye Reactive Messaging (dead-letter-queue strategy) or the raw Kafka client with a hand-written retry/DLT loop | **Largest.** All DLT/retry/replay behaviour hangs on it |
+| Spring Security: JWT resource server, role rules (`SagaSecurityConfig`), the console's OAuth2 login with session and CSRF | MicroProfile JWT or an OIDC extension; without one, a `ContainerRequestFilter` + JWT library + a hand-written login flow | Large; easy to get subtly wrong |
+| Actuator: health, Prometheus, custom endpoints (`dlt`, `stucksagas`, `notificationprovider`) | MicroProfile Health + Micrometer; the custom endpoints become ordinary JAX-RS resources | Moderate |
+| `@Scheduled` (outbox relay, `SagaTimeoutScanner`) | Jakarta EE `@Schedule` / a managed scheduled executor | Easy |
+| `@ConfigurationProperties`, profiles | MicroProfile Config | Easy |
+| e2e harness (starts the Boot jars) | Change how the services are launched | Moderate |
+
+**Carries over unchanged:**
+- `OrderSaga` and its transitions, the message records, `MessageCodec`;
+- the Flyway migrations, the topic design, the Keycloak realm, the console's static files;
+- the design itself: outbox, idempotency, fencing, timeouts.
+
+**Options, ranked:**
+1. **Quarkus.** RESTEasy-based REST, SmallRye Kafka with dead-letter support, Hibernate, OIDC, Health, Micrometer. The closest match and the least hand-wiring.
+2. **A Jakarta EE / MicroProfile server** such as WildFly, which ships RESTEasy. Weaker Kafka support.
+3. **Plain embedded RESTEasy** (Undertow/Netty), with every library assembled by hand. Rewrites the transactions, retry/DLT and security; the most work and the most risk.
+
+**If ever tried:** pilot one participant service (inventory or shipping) on Quarkus, and run it against the unchanged 33-test e2e suite. It tests over HTTP and Kafka, not Spring internals, so it checks the port as it stands.
 
 ## Next / open
 - [ ] **Production identity setup:**
