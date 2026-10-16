@@ -15,16 +15,18 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 
 import com.saga.common.kafka.dlt.DltProperties;
 import com.saga.common.messaging.Topics;
+import com.saga.common.retention.RetentionProperties;
 
 @Configuration
 @EnableScheduling
-@EnableConfigurationProperties(DltProperties.class)
+@EnableConfigurationProperties({DltProperties.class, RetentionProperties.class})
 public class SagaCommonConfig {
 
     /** DLTs must have at least as many partitions as their source: records keep their partition. */
     private static final int PARTITIONS = 3;
     private static final int REPLICAS = 1;
-    private static final Duration DLT_RETENTION = Duration.ofDays(14);
+    /** Dead letters older than this are deleted by Kafka; idempotency markers must be kept longer (RetentionProperties). */
+    public static final Duration DLT_RETENTION = Duration.ofDays(14);
 
     @Bean
     KafkaAdmin.NewTopics sagaTopics() {

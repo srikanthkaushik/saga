@@ -1,5 +1,6 @@
 package com.saga.common.idempotency;
 
+import java.time.Instant;
 import java.util.UUID;
 
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -19,4 +20,16 @@ public interface ProcessedMessageRepository extends JpaRepository<ProcessedMessa
             on conflict (message_id) do nothing
             """, nativeQuery = true)
     int markProcessed(@Param("messageId") UUID messageId);
+
+    /** Deletes up to {@code limit} markers recorded before {@code cutoff}. */
+    @Modifying
+    @Query(value = """
+            delete from processed_message
+            where message_id in (
+                select message_id from processed_message
+                where processed_at < :cutoff
+                limit :limit
+                for update skip locked)
+            """, nativeQuery = true)
+    int deleteProcessedBefore(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
 }

@@ -311,6 +311,8 @@ If any send fails, the transaction rolls back and the whole batch is retried on 
 
 `SKIP LOCKED` lets several instances of a service relay in parallel without double-sending the same row. With one instance per service, per-key order is preserved; with several, it becomes best-effort.
 
+**Retention.** Published rows are history only: the console's message timeline reads them. [`RetentionJob`](../saga-common/src/main/java/com/saga/common/retention/RetentionJob.java) deletes them after `saga.retention.outbox-retention` (7 days) and never deletes unpublished rows. It works in batches, one transaction each, and picks rows with `SKIP LOCKED`, so it never blocks the relay.
+
 ### 5.2 Idempotent consumers
 **Problem.** At-least-once delivery means duplicates. Kafka redelivers after a crash or rebalance, and the outbox may re-send after a partial failure. Processing a ProcessPayment twice would charge twice.
 
@@ -319,6 +321,8 @@ If any send fails, the transaction rolls back and the whole batch is retried on 
    - If 0 rows are inserted, the message was seen before and the handler returns.
    - The insert is in the **same transaction** as the handler's work. If the handler fails, the marker rolls back too and the redelivery is processed properly.
 2. **Business-key level.** Participants also key on the order: `payment.order_id` and `reservation.order_id` are unique. A second ProcessPayment for an order that's already paid replies `PaymentProcessed` without charging again, even if it has a new `messageId` (for example, re-sent by a timeout).
+
+**Marker retention.** `RetentionJob` deletes `processed_message` rows after `saga.retention.processed-message-retention` (30 days). That has to outlive every way a message can come back with its original id. Kafka redelivery takes minutes. A DLT replay can come up to 14 days later (the DLT retention), and a replay keeps the `messageId`. Past that window, layer 2 still makes a late duplicate harmless; layer 1 just makes it cheap.
 
 [Scenario 5](SCENARIOS.md#scenario-5--duplicate-deliveries-are-harmless) shows both layers.
 

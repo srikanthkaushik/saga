@@ -58,6 +58,7 @@ com.saga
 │   ├── security                SagaSecurityConfig (the access rulebook for all five services)
 │   ├── kafka                   KafkaErrorHandlingConfig (retry/DLT), RetryProperties
 │   │   └── dlt                 DltEndpoint, DltReplayer, DltMetrics, OwnedTopics
+│   ├── retention               RetentionJob (outbox and processed_message cleanup), RetentionProperties
 │   └── SagaCommonConfig        @EnableScheduling + topic creation
 ├── order                       (order-service)
 │   ├── api                     OrderController, OrderService, request/response records
@@ -159,6 +160,7 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 | `kafka/RetryProperties` | `saga.kafka.retry.*` |
 | `kafka/dlt/DltEndpoint`, `DltReplayer` | Actuator `dlt`: pending counts and replay, scoped to this service's listeners |
 | `kafka/dlt/DltMetrics`, `OwnedTopics` | `saga_dlt_pending{topic,dlt}` gauge per owned DLT, refreshed on its own thread; the topics this service's listeners consume |
+| `retention/RetentionJob`, `RetentionProperties` | Scheduled, batched deletion of published outbox rows (7d) and idempotency markers (30d) |
 | `SagaCommonConfig` | `@EnableScheduling`; declares the 5 topics + 5 DLTs (3 partitions, DLT retention 14 days) |
 | `security/SagaSecurityConfig` | OAuth2 resource-server `SecurityFilterChain`: who may call which method + path (public / viewer / operator / admin / metrics), stateless, deny by default |
 
@@ -235,6 +237,7 @@ There are two layers of tests:
 |---|---|
 | [`OrderSagaTest`](../order-service/src/test/java/com/saga/order/saga/OrderSagaTest.java) | Each of the 12 transitions is legal from exactly one state; from any other state it throws and changes nothing. Deadlines are set or cleared; `compensatingSince` is kept; re-sends reset per compensation step; resend, retry and resolve only work while compensating |
 | [`OrderSagaOrchestratorTest`](../order-service/src/test/java/com/saga/order/saga/OrderSagaOrchestratorTest.java) | Each reply in its state sends exactly the next command or event. Each reply in any of the 7 other states (late, early, stale) is ignored with no message sent. Duplicates are dropped before the saga is loaded; a re-sent reply with a new id is stopped by the state guard. Unknown sagas and non-replies are non-retryable. Timeouts per state; compensation re-sends are reported only after commit |
+| [`RetentionJobTest`](../payment-service/src/test/java/com/saga/payment/RetentionJobTest.java) | Old published outbox rows and markers are deleted, recent ones and every unpublished row kept; a run stops after `max-batches-per-run` and the next continues; the switch disables it |
 | [`PaymentCommandHandlerTest`](../payment-service/src/test/java/com/saga/payment/PaymentCommandHandlerTest.java), [`InventoryCommandHandlerTest`](../inventory-service/src/test/java/com/saga/inventory/InventoryCommandHandlerTest.java), [`ShippingCommandHandlerTest`](../shipping-service/src/test/java/com/saga/shipping/ShippingCommandHandlerTest.java) | Same messageId twice → handled once. Same command under a new messageId (a re-sent step or compensation) → applied once, answered every time. A compensation that overtakes its step leaves a tombstone that refuses the late step. Foreign commands are non-retryable. Payment: a failed attempt rolls back the processed marker, so the redelivery is handled, not skipped |
 | [`NotificationHandlerTest`](../notification-service/src/test/java/com/saga/notification/NotificationHandlerTest.java) | One notification per order outcome however often the event arrives; a provider outage leaves no marker, so the retry notifies once |
 | [`PostgresSliceTest`](../saga-common/src/test/java/com/saga/common/test/PostgresSliceTest.java), [`TestMessages`](../saga-common/src/test/java/com/saga/common/test/TestMessages.java) (saga-common test-jar) | `@DataJpaTest` against a Testcontainers Postgres 17 (one per module, through the context cache), with the codec, idempotency guard and outbox writer; builds records the way the relay publishes them and decodes what a handler wrote to the outbox. Skipped without Docker |

@@ -129,6 +129,11 @@ Replies that don't match the saga's current state (late, duplicate, out of order
   - Every intervention is recorded in `saga_intervention` (action, operator, note, from-state, to-state, time) and logged at WARN.
   - The operator is the **authenticated user** (the token's `preferred_username`, via the actuator `SecurityContext`). Any `operator` in the body is ignored.
 - **Admin APIs are actuator endpoints**, not controllers, so they are off unless exposed.
+- **Retention cleanup** (`RetentionJob`, 2026-10-16).
+  - Deletes published outbox rows after 7 days and idempotency markers after 30 days, in batches of 1000 (one transaction each), picked with `SKIP LOCKED` so instances and the relay never block each other.
+  - Unpublished rows are never deleted.
+  - Markers outlive the 14-day DLT retention on purpose: a replay keeps the original `messageId`, and the marker is what makes it a no-op. Past that window the handlers' business-key checks (tombstones, state guard, unique notification) still hold.
+  - Runs on the shared `@Scheduled` thread, capped per run (`max-batches-per-run`) so it never holds the outbox relay up for long. Counter `saga_retention_deleted_total{table}`.
 
 **Security** (details in [Architecture §9](docs/ARCHITECTURE.md#9-security))
 - **OAuth2/JWT via Keycloak.** The five services are resource servers sharing one rulebook, `SagaSecurityConfig` in saga-common: stateless, deny by default. They validate the signature (JWKS), the issuer `http://localhost:8180/realms/saga` and the audience `saga-api`. Roles are mapped from the `roles` claim by Boot properties (`authorities-claim-name`, `authority-prefix`, `principal-claim-name`); no custom converter.
@@ -154,6 +159,11 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 | `saga.alert.stuck-after-resends` | 3 | order | about 2 minutes with 30s compensation timeouts |
 | `saga.alert.refresh-interval` | 15s | order | gauge refresh |
 | `saga.dlt.metrics-refresh-interval` | 30s | all | `saga_dlt_pending` refresh; opens a short-lived consumer per owned DLT |
+| `saga.retention.enabled` | true | all | retention cleanup on or off |
+| `saga.retention.interval` / `.initial-delay` | 1h / 1m | all | |
+| `saga.retention.outbox-retention` | 7d | all | published outbox rows; the console timeline is lost with them |
+| `saga.retention.processed-message-retention` | 30d | all | keep above the DLT retention (14d); a WARN at startup if not |
+| `saga.retention.batch-size` / `.max-batches-per-run` | 1000 / 20 | all | one transaction per batch; at most 20000 rows per table per run |
 
 ## Saga console (`saga-ui`)
 - **Saga tab:**
@@ -234,6 +244,7 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 | order | V6 | `orders.destination` (default GB); compensating partial index recreated with CANCELLING_SHIPMENT |
 | shipping | V1 | shipping_zone (+ seed GB/US/DE served, XX not), shipment, outbox, processed_message |
 | notification | V1 | notification (unique order_id + type), outbox (unused), processed_message |
+| order V7 / payment V4 / inventory V4 / shipping V2 / notification V2 | – | `outbox(published_at)` and `processed_message(processed_at)` indexes for the retention cleanup |
 
 ## Container images
 - **`ops\images.cmd <tag> [push]`** packages the jars and builds eight images, `${SAGA_REGISTRY}/saga-*` (default `ghcr.io/srikanthkaushik`):
@@ -296,7 +307,7 @@ curl http://localhost:8081/orders/<id>
 ## Tests
 - `mvn test`: per-service tests, about a minute (see [Codebase tour §5.1](docs/CODEBASE.md#51-per-service-tests)):
   - `OrderSagaTest` (108) and `OrderSagaOrchestratorTest` (89): plain JUnit and Mockito, no Spring;
-  - `PaymentCommandHandlerTest` (6), `InventoryCommandHandlerTest` (7), `ShippingCommandHandlerTest` (6) and `NotificationHandlerTest` (4): `@PostgresSliceTest` (`@DataJpaTest` + Testcontainers Postgres 17 + the service's Flyway migrations), from the saga-common **test-jar**.
+  - `PaymentCommandHandlerTest` (6), `RetentionJobTest` (4), `InventoryCommandHandlerTest` (7), `ShippingCommandHandlerTest` (6) and `NotificationHandlerTest` (4): `@PostgresSliceTest` (`@DataJpaTest` + Testcontainers Postgres 17 + the service's Flyway migrations), from the saga-common **test-jar**.
 - `mvn clean verify` also runs `SagaEndToEndIT`: 34 tests, about 3 minutes. Docker is required; both suites are skipped automatically without it. Add `-DskipITs` to skip the e2e suite only.
 - Slice-test conventions:
   - each test uses fresh UUID ids and runs in a rolled-back transaction;
@@ -353,6 +364,7 @@ curl http://localhost:8081/orders/<id>
 - [x] 2026-10-12: Architecture guide explains orchestration vs choreography: what each is, a comparison, where each is used here (saga commands and replies vs `order.events`), why, the outbox hand-over between them, how to see it in the console, and which style a new service should use.
 - [x] 2026-10-12: recorded the RESTEasy/JAX-RS port analysis (see "Evaluated: porting off Spring Boot").
 - [x] 2026-10-16: **Per-service tests**: 220 tests (state machine and orchestrator without Spring; participant handlers as Postgres slices). Shared `@PostgresSliceTest` and `TestMessages` in the saga-common test-jar.
+- [x] 2026-10-16: **Retention cleanup**: `RetentionJob` (published outbox 7d, markers 30d, batched, `SKIP LOCKED`), index migrations on all five services, `RetentionJobTest` (4) against Postgres.
 - [x] 2026-10-16: **Dead-letter alerting**:
   - `DltMetrics` (`saga_dlt_pending{topic,dlt}`, own refresh thread, updated on replay);
   - Prometheus export on all five services;
@@ -406,7 +418,7 @@ curl http://localhost:8081/orders/<id>
 - [ ] Browser tests for the console in CI (e.g. Playwright for Java), if it becomes more than a dev tool.
 - [ ] Participant-side admin operations (refund or release through payment and inventory endpoints) so `resolve` never needs raw SQL.
 - [ ] Selective DLT replay (by messageId or offset range) and a "skip" operation for known-garbage records.
-- [ ] Outbox cleanup job (published rows grow forever) and `processed_message` retention.
+- [ ] Alert on outbox lag (oldest unpublished row): the cleanup never deletes unpublished rows, so a stuck relay still grows the table.
 - [ ] CI: run `mvn verify` and the promtool rule tests.
 - [ ] Externalize DB/Kafka credentials. Topic replication factor 1 is local-only.
 - [ ] Consider Debezium CDC instead of the polling relay if latency or DB load matters.

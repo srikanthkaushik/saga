@@ -175,3 +175,14 @@ Orders are decided regardless of notification-service; only the e-mail is late. 
 1. **Up?** `curl http://localhost:8085/actuator/health`.
 2. **Provider switched off?** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8085/actuator/notificationprovider`. If `"available":false`, someone took it down (operator role); bring it back with `POST … -d "{\"available\":true}"`.
 3. **Dead-lettered events?** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8085/actuator/dlt/order.events`. Once the provider works, replay them (`POST /actuator/dlt/order.events`). Each order outcome is notified at most once however often you replay.
+
+## Outbox and processed_message growth
+`RetentionJob` runs hourly in every service and deletes, in batches:
+- published outbox rows older than 7 days (`saga.retention.outbox-retention`);
+- idempotency markers older than 30 days (`saga.retention.processed-message-retention`).
+
+The log line `Retention cleanup deleted …` and the counter `saga_retention_deleted_total{table}` show it working.
+- **The outbox keeps growing anyway?** The job never deletes unpublished rows. Check for a backlog: `psql -U saga -d <service>_db -c "select count(*), min(created_at) from outbox where published_at is null"`. A backlog means the relay can't reach Kafka; check the service log and Kafka.
+- **Catching up after a long outage:** one run deletes at most `batch-size × max-batches-per-run` (20000) rows per table, so a large backlog clears over several hours. Raise `saga.retention.max-batches-per-run` temporarily if needed.
+- **Don't shorten marker retention below 14 days** (the DLT retention). The service logs a WARN at startup if you do. A DLT replay after the marker is gone is handled a second time. The handlers' business-key checks still make that harmless, but it's no longer free.
+- **The console shows no timeline for an old order:** expected once its outbox rows are past retention. The order and saga state themselves are kept.
