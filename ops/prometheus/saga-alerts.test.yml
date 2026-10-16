@@ -74,3 +74,65 @@ tests:
               summary: "No saga compensation metrics are being scraped"
               description: >-
                 order-service is down or no longer scraped, so stuck compensations would go unnoticed.
+
+  # Two payment-service instances report the same Kafka-wide value: alert with 3, not 6, and per topic.
+  - interval: 15s
+    input_series:
+      - series: 'saga_dlt_pending{instance="payment-1",topic="payment.commands",dlt="payment.commands-dlt"}'
+        values: '0 0 3x10'
+      - series: 'saga_dlt_pending{instance="payment-2",topic="payment.commands",dlt="payment.commands-dlt"}'
+        values: '0 0 3x10'
+      - series: 'saga_dlt_pending{instance="order-1",topic="order.saga.replies",dlt="order.saga.replies-dlt"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SagaDeadLettersPending
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: SagaDeadLettersPending
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              topic: payment.commands
+            exp_annotations:
+              summary: "3 dead-lettered record(s) waiting on payment.commands-dlt"
+              description: >-
+                3 record(s) on payment.commands failed every retry and were dead-lettered. Until they are
+                replayed, the sagas or notifications they belong to are stalled (timeouts compensate stalled saga steps;
+                a dead-lettered compensation shows up as SagaCompensationStuck). Inspect them with
+                GET /actuator/dlt/payment.commands on the owning service, fix the cause, then replay with
+                POST /actuator/dlt/payment.commands. Runbook: ops/RUNBOOK.md
+
+  # Replayed within the 1m "for": never fires.
+  - interval: 15s
+    input_series:
+      - series: 'saga_dlt_pending{instance="notify-1",topic="order.events",dlt="order.events-dlt"}'
+        values: '0 2 2 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: SagaDeadLettersPending
+        exp_alerts: []
+
+  # shipping-service is not reporting: only its topic is flagged.
+  - interval: 1m
+    input_series:
+      - series: 'saga_dlt_pending{instance="payment-1",topic="payment.commands"}'
+        values: '0x15'
+      - series: 'saga_dlt_pending{instance="inventory-1",topic="inventory.commands"}'
+        values: '0x15'
+      - series: 'saga_dlt_pending{instance="order-1",topic="order.saga.replies"}'
+        values: '0x15'
+      - series: 'saga_dlt_pending{instance="notify-1",topic="order.events"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: SagaDeadLetterMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              topic: shipping.commands
+            exp_annotations:
+              summary: "No dead-letter metrics for shipping.commands"
+              description: >-
+                The service consuming shipping.commands is down, not scraped, or cannot reach Kafka, so records
+                dead-lettered there would go unnoticed.

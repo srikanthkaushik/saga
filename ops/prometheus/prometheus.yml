@@ -1,6 +1,7 @@
 # Example Prometheus configuration for the saga services (not started by docker-compose).
 # /actuator/prometheus requires a token with the saga-metrics (or saga-viewer) role: Prometheus gets one itself
 # from Keycloak with the client-credentials grant of the 'saga-prometheus' client.
+# Every service reports saga_dlt_pending for the DLTs it owns; order-service also reports saga_compensation_*.
 # Validate: docker run --rm -v "%cd%\ops\prometheus":/etc/prometheus --entrypoint promtool prom/prometheus check config /etc/prometheus/prometheus.yml
 global:
   scrape_interval: 15s
@@ -9,13 +10,27 @@ rule_files:
   - saga-alerts.yml
 
 scrape_configs:
-  - job_name: order-service
+  - job_name: saga-services
     metrics_path: /actuator/prometheus
     oauth2:
       client_id: saga-prometheus
       # Development secret from docker/keycloak/saga-realm.json; in a real setup use client_secret_file
       client_secret: saga-prometheus-dev-secret
       token_url: http://localhost:8180/realms/saga/protocol/openid-connect/token
+    # host.docker.internal when Prometheus runs in Docker Desktop and the services on the host
     static_configs:
-      # host.docker.internal when Prometheus runs in Docker Desktop and the service on the host
       - targets: ["host.docker.internal:8081"]
+        labels:
+          service: order-service
+      - targets: ["host.docker.internal:8082"]
+        labels:
+          service: payment-service
+      - targets: ["host.docker.internal:8083"]
+        labels:
+          service: inventory-service
+      - targets: ["host.docker.internal:8084"]
+        labels:
+          service: shipping-service
+      - targets: ["host.docker.internal:8085"]
+        labels:
+          service: notification-service

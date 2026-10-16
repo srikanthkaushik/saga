@@ -497,7 +497,7 @@ Try this: open the **API console** tab. Click through the catalogue entries for 
 ```
 mvn clean verify
 ```
-(Stop your local services first. The suite brings up its own Postgres, Kafka and Keycloak with Testcontainers and runs the six real jars. It takes about 3 minutes.)
+(Stop your local services first. The suite brings up its own Postgres, Kafka and Keycloak with Testcontainers and runs the six real jars. It takes about 4 minutes: about a minute of per-service tests (one Postgres container per service), then about 3 minutes of end-to-end tests.)
 
 To speed things up, the tests run the services with 1 s/2 s/4 s backoff, 3 s step timeouts, a stuck threshold of 2, and 500 ms gauge refresh. Logs from the run are in `saga-e2e\target\e2e-logs\`.
 
@@ -508,7 +508,7 @@ To speed things up, the tests run the services with 1 s/2 s/4 s backoff, 3 s ste
 | `outOfStock_compensatesWithRefund_andRejectsOrder` | 3 |
 | `concurrentOrders_neverOversellStock_andRefundTheLosers` | 4 |
 | `unknownMessageType_skipsRetries_andIsDeadLetteredImmediately`, `transientHandlerFailure_isRetriedWithBackoff_thenDeadLettered`, `replyForUnknownSaga_isDeadLettered_andSagaFlowKeepsWorking` | 6 |
-| `replay_reprocessesDeadLetter_onceTheCauseIsFixed`, `replay_ofStillBrokenMessage_landsBackOnDlt_withReplayCount`, `dltEndpoint_onlyServesTopicsTheServiceConsumes` | 7 |
+| `replay_reprocessesDeadLetter_onceTheCauseIsFixed`, `replay_ofStillBrokenMessage_landsBackOnDlt_withReplayCount`, `dltEndpoint_onlyServesTopicsTheServiceConsumes`, `everyService_exportsTheDeadLetterGauge_forTheDltItOwns` | 7 |
 | `paymentTimeout_refundsTheLateCharge_andRejectsOrder` (stalls payment with poison messages instead of stopping it) | 8 |
 | `inventoryTimeout_releasesTheLateReservation_refunds_andRejectsOrder` | 9 |
 | `refundBeforeCharge_leavesTombstone_andRefusesTheLateCharge`, `releaseBeforeReserve_leavesTombstone_andRefusesTheLateReservation` | 10 |
@@ -520,7 +520,7 @@ To speed things up, the tests run the services with 1 s/2 s/4 s backoff, 3 s ste
 | `notificationOutage_neverAffectsTheOrder_andReplayNotifiesExactlyOnce` | 17 |
 | `services_enforceRolesPerEndpoint`, `console_requiresLogin_relaysTheUsersToken_andChecksCsrfAndRoles`, `services_rejectTokensFromTheWrongIssuer_andGarbage`, `prometheusClient_canScrapeMetrics_butNothingElse` | security ([Architecture §9](ARCHITECTURE.md#9-security)) |
 
-Duplicate delivery (Scenario 5) is covered implicitly. Every compensation re-send and every replay in the suite relies on it.
+Duplicate delivery (Scenario 5) is covered implicitly here: every compensation re-send and every replay in the suite relies on it. It is also tested directly, per service, by the slice tests in the `test` phase ([Codebase tour §5.1](CODEBASE.md#51-per-service-tests)): same messageId twice, the same command under a new messageId, and out-of-order or late replies to the orchestrator.
 
 ---
 

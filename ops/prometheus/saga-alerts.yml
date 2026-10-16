@@ -1,5 +1,5 @@
 # Prometheus alerting rules for the order saga.
-# Metrics come from order-service /actuator/prometheus. The gauges are database-wide, so every
+# saga_compensation_* comes from order-service /actuator/prometheus. Those gauges are database-wide, so every
 # order-service instance reports the same value: aggregate with max(), never sum().
 groups:
   - name: saga-compensation
@@ -38,3 +38,37 @@ groups:
           summary: "No saga compensation metrics are being scraped"
           description: >-
             order-service is down or no longer scraped, so stuck compensations would go unnoticed.
+
+  - name: saga-dead-letters
+    # saga_dlt_pending comes from every service's /actuator/prometheus, one series per DLT the service owns
+    # (label topic = the source topic). Instances of one service report the same Kafka-wide value: max by (topic).
+    rules:
+      - alert: SagaDeadLettersPending
+        expr: max by (topic) (saga_dlt_pending) > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} dead-lettered record(s) waiting on {{ $labels.topic }}-dlt"
+          description: >-
+            {{ $value }} record(s) on {{ $labels.topic }} failed every retry and were dead-lettered. Until they are
+            replayed, the sagas or notifications they belong to are stalled (timeouts compensate stalled saga steps;
+            a dead-lettered compensation shows up as SagaCompensationStuck). Inspect them with
+            GET /actuator/dlt/{{ $labels.topic }} on the owning service, fix the cause, then replay with
+            POST /actuator/dlt/{{ $labels.topic }}. Runbook: ops/RUNBOOK.md
+
+      - alert: SagaDeadLetterMetricsMissing
+        expr: >-
+          absent(saga_dlt_pending{topic="payment.commands"})
+          or absent(saga_dlt_pending{topic="inventory.commands"})
+          or absent(saga_dlt_pending{topic="shipping.commands"})
+          or absent(saga_dlt_pending{topic="order.saga.replies"})
+          or absent(saga_dlt_pending{topic="order.events"})
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "No dead-letter metrics for {{ $labels.topic }}"
+          description: >-
+            The service consuming {{ $labels.topic }} is down, not scraped, or cannot reach Kafka, so records
+            dead-lettered there would go unnoticed.

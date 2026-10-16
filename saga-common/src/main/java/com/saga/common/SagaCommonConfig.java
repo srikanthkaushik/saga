@@ -6,16 +6,19 @@ import java.util.List;
 
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.TopicConfig;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.KafkaAdmin;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
+import com.saga.common.kafka.dlt.DltProperties;
 import com.saga.common.messaging.Topics;
 
 @Configuration
 @EnableScheduling
+@EnableConfigurationProperties(DltProperties.class)
 public class SagaCommonConfig {
 
     /** DLTs must have at least as many partitions as their source: records keep their partition. */

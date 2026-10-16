@@ -367,6 +367,8 @@ class SagaEndToEndIT {
         kafka.awaitDeadLetter("order.saga.replies-dlt", messageId, DLT_TIMEOUT)
                 .orElseThrow(() -> new AssertionError("reply " + messageId + " never dead-lettered"));
         assertThat(dltStatus(orderService, "order.saga.replies").get("pending").asLong()).isPositive();
+        await("saga_dlt_pending for order.saga.replies").atMost(Duration.ofSeconds(10))
+                .until(() -> dltPendingGauge(orderService, "order.saga.replies"), value -> value >= 1);
 
         // Fix the cause: the saga now exists, waiting for exactly that reply
         seedSaga(orderId, sagaId, "PAYMENT_PENDING", "replay-customer", product);
@@ -823,6 +825,28 @@ class SagaEndToEndIT {
                 .isEqualTo(403);
     }
 
+    /** Every service exports saga_dlt_pending for exactly the DLT it owns (what SagaDeadLettersPending alerts on). */
+    @Test
+    void everyService_exportsTheDeadLetterGauge_forTheDltItOwns() throws Exception {
+        Map<ServiceProcess, String> owned = Map.of(
+                orderService, "order.saga.replies",
+                paymentService, "payment.commands",
+                inventoryService, "inventory.commands",
+                shippingService, "shipping.commands",
+                notificationService, "order.events");
+        for (Map.Entry<ServiceProcess, String> entry : owned.entrySet()) {
+            ServiceProcess service = entry.getKey();
+            String topic = entry.getValue();
+            await("saga_dlt_pending for " + topic).atMost(Duration.ofSeconds(10))
+                    .until(() -> dltPendingGauge(service, topic), value -> value >= 0);
+            for (String other : owned.values()) {
+                if (!other.equals(topic)) {
+                    assertThat(dltPendingGauge(service, other)).as(other + " on the service owning " + topic).isNegative();
+                }
+            }
+        }
+    }
+
     @Test
     void console_requiresLogin_relaysTheUsersToken_andChecksCsrfAndRoles() throws Exception {
         // Not signed in: browsers go to Keycloak, API calls get a 401 the page can recognise
@@ -1121,6 +1145,16 @@ class SagaEndToEndIT {
         throw new AssertionError("No VALUE/COUNT measurement for " + name + ": " + metric);
     }
 
+    /** The scraped {@code saga_dlt_pending} value for {@code topic}, or -1 if the service does not export it. */
+    private static double dltPendingGauge(ServiceProcess service, String topic) throws Exception {
+        String label = "topic=\"" + topic + "\"";
+        return get(service, "/actuator/prometheus").lines()
+                .filter(line -> line.startsWith("saga_dlt_pending{") && line.contains(label))
+                .mapToDouble(line -> Double.parseDouble(line.substring(line.lastIndexOf(' ') + 1)))
+                .findFirst()
+                .orElse(-1);
+    }
+
     private static String get(ServiceProcess service, String path) throws Exception {
         HttpResponse<String> response = HTTP.send(
                 authed(URI.create(service.baseUrl() + path)).build(),
@@ -1209,6 +1243,7 @@ class SagaEndToEndIT {
                 Map.entry("saga.timeout.scan-interval", "250ms"),
                 Map.entry("saga.alert.stuck-after-resends", String.valueOf(STUCK_AFTER_RESENDS)),
                 Map.entry("saga.alert.refresh-interval", "500ms"),
+                Map.entry("saga.dlt.metrics-refresh-interval", "500ms"),
                 Map.entry("spring.security.oauth2.resourceserver.jwt.issuer-uri", KEYCLOAK.issuer())));
         SERVICES.add(service);
         return service;

@@ -129,7 +129,27 @@ Prometheus isn't receiving `saga_compensation_*`, so stuck compensations would g
 
 ---
 
-## Dead-lettered messages (no alert yet)
+## SagaDeadLettersPending (ticket)
+
+**Meaning:** records on the `topic` in the alert's label failed every retry and sit on `<topic>-dlt`, not yet replayed. The value is `saga_dlt_pending`, which the owning service refreshes every 30s (`saga.dlt.metrics-refresh-interval`) and right after each DLT read or replay. What a dead letter blocks depends on the topic:
+
+| Topic | Effect until replayed |
+|---|---|
+| `payment.commands`, `inventory.commands`, `shipping.commands` | A forward step: its saga times out and is compensated, so the order is rejected. A compensation command (refund, release, cancel): the saga keeps re-sending it, and after `saga.alert.stuck-after-resends` re-sends SagaCompensationStuck **pages**. Handle that alert first. |
+| `order.saga.replies` | The saga waits for a reply that never arrives and times out. |
+| `order.events` | The customer is not notified. The order itself is unaffected. |
+
+It is a ticket and not a page, because a saga is never left inconsistent without SagaCompensationStuck also firing. It does not clear on its own: dead letters stay until someone replays them, or until DLT retention (14 days) deletes them, which loses them.
+
+Then follow the steps below. Once the replay is done the gauge drops to 0 and the alert resolves. A record that fails again comes back as a new pending record, with `dltReplayCount` incremented.
+
+## SagaDeadLetterMetricsMissing (ticket)
+For at least 10 minutes no instance has reported `saga_dlt_pending` for the topic in the label. Check, in this order:
+1. Is the owning service (table below) up?
+2. Is its `/actuator/prometheus` scraped? `ops/prometheus/prometheus.yml` has one target per service.
+3. Can it reach Kafka? The gauge only appears after its first successful refresh. The service log shows `Refreshing saga.dlt.pending for <topic> failed` while it can't.
+
+## Dead-lettered messages
 Each service only sees and replays its own DLT:
 
 | Service | DLT |
@@ -150,7 +170,7 @@ To look at what was dead-lettered and why (local stack), open AKHQ at http://loc
 - **Commands for finished sagas are refused safely.** Replaying a charge or reservation for a saga that has already been compensated hits the tombstone and is refused. That's expected, not an error.
 - **Replies for finished sagas are dropped** by the orchestrator's state guard (WARN `ignoring …`).
 
-## Customers not being notified (no alert yet)
+## Customers not being notified (no alert of its own; a dead-lettered event raises SagaDeadLettersPending for `order.events`)
 Orders are decided regardless of notification-service; only the e-mail is late. Check, on notification-service (8085):
 1. **Up?** `curl http://localhost:8085/actuator/health`.
 2. **Provider switched off?** `curl -H "Authorization: Bearer %TOKEN%" http://localhost:8085/actuator/notificationprovider`. If `"available":false`, someone took it down (operator role); bring it back with `POST … -d "{\"available\":true}"`.

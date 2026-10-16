@@ -4,6 +4,11 @@
 
 Order saga using orchestration over Kafka, with choreographed domain events for what happens after the outcome. Java 21, Spring Boot 4.0.6, PostgreSQL 17, Kafka 4.0 (KRaft), multi-module Maven.
 
+**Checkpoint 2026-10-16:** two former open items closed.
+- **Per-service tests:** 220 tests in the `test` phase. The order saga state machine and orchestrator are tested without Spring, covering every legal and illegal transition and every reply in every wrong state. Each participant handler is a JPA slice against real Postgres, covering duplicate delivery, re-sent commands, tombstones and marker rollback.
+- **Dead-letter alerting:** `saga_dlt_pending` on all five services, the rules `SagaDeadLettersPending` and `SagaDeadLetterMetricsMissing` with promtool tests, a Prometheus scrape job for every service, and runbook entries.
+- 34 e2e tests green.
+
 **Checkpoint 2026-10-10:** two more services. **shipping-service** is the saga's third step and its **pivot**: a refused shipment undoes stock and payment in reverse order; a shipping timeout cancels, releases and refunds (state CANCELLING_SHIPMENT). **notification-service** subscribes to `OrderApproved`/`OrderRejected` events on `order.events` (choreography) and is a retriable step: it never affects the order. 33 e2e tests green.
 
 **Checkpoint 2026-10-09:** feature-complete for the core saga plus its failure handling: outbox, idempotency, DLT with backoff and replay, timeouts with fencing, stuck-compensation alerting, and manual resolution. A local **saga console** (`saga-ui`, http://localhost:8080) demos and exercises all of it. 23 e2e tests green, promtool rule tests green. Admin endpoints, seed endpoints and the console are secured with **OAuth2/JWT (Keycloak)**, with roles viewer, operator, admin and metrics. Not yet production-hardened: Keycloak runs in dev mode and the secrets are dev defaults (see [Next / open](#next--open)).
@@ -113,6 +118,11 @@ Replies that don't match the saga's current state (late, duplicate, out of order
   - `compensation_resends` counts re-sends of the current compensation step and resets on entering a new one. Stuck means resends ≥ `saga.alert.stuck-after-resends`.
   - At the threshold there is one ERROR `STUCK COMPENSATION` log line, then an ERROR per further re-send. It is logged after commit only.
   - Gauges are refreshed from the DB on a schedule (not per scrape) and are database-wide, so the alert rules use `max()`, not `sum()`.
+- **Dead-letter alerting** (`DltMetrics`, 2026-10-16).
+  - `saga_dlt_pending{topic,dlt}` per owned DLT on every service: the same "not yet replayed" count as `GET /actuator/dlt`, so it drops to 0 after a replay even if a record fails again; it then comes back as new pending.
+  - Refreshed on its **own daemon thread**, not `@Scheduled`: Boot's scheduler has one thread, and with Kafka down a refresh blocks for the consumer API timeout, which would delay the outbox relay and the timeout scanner. The DLT endpoint also records every read and replay, so the alert clears straight after an operator replays.
+  - Gauges are registered on the first successful refresh; a service that never reached Kafka has no series, and `SagaDeadLetterMetricsMissing` covers that.
+  - Alert severity is **ticket**: a dead-lettered compensation already pages via SagaCompensationStuck, and dead-lettered forward steps are compensated by timeouts.
 - **Manual resolution** (`SagaInterventionService` via `stucksagas` write operation).
   - `retry` re-sends now and resets the stuck count.
   - `resolve` closes the saga as FAILED and requires a note. **The manual compensation must be done in the participant's own records first**; then any queued or replayed compensation is a no-op there. See `ops\RUNBOOK.md`.
@@ -143,6 +153,7 @@ Replies that don't match the saga's current state (late, duplicate, out of order
 | `saga.timeout.batch-size` | 100 | order | overdue sagas per scan |
 | `saga.alert.stuck-after-resends` | 3 | order | about 2 minutes with 30s compensation timeouts |
 | `saga.alert.refresh-interval` | 15s | order | gauge refresh |
+| `saga.dlt.metrics-refresh-interval` | 30s | all | `saga_dlt_pending` refresh; opens a short-lived consumer per owned DLT |
 
 ## Saga console (`saga-ui`)
 - **Saga tab:**
@@ -190,18 +201,21 @@ Roles: viewer < operator < admin (composite); `saga-metrics` only reaches `/actu
 | `GET /actuator/notificationprovider` | notification | provider available, sent and refused counts. viewer |
 | `POST /actuator/notificationprovider` body `{"available"}` | notification | switch the simulated provider off or on. **operator** |
 | `GET /actuator/metrics` | order | Micrometer. viewer |
-| `GET /actuator/prometheus` | order | Prometheus scrape. metrics or viewer |
+| `GET /actuator/prometheus` | all | Prometheus scrape. metrics or viewer |
 
 Metrics:
 - `saga_compensation_stuck`
 - `saga_compensation_in_progress`
 - `saga_compensation_oldest_age_seconds`
 - `saga_compensation_resends_total`
+- `saga_dlt_pending{topic,dlt}` (every service, one series per owned DLT; refreshed every `saga.dlt.metrics-refresh-interval`, default 30s, and after each DLT read or replay)
 
 Alert rules (`ops\prometheus\saga-alerts.yml`):
 - `SagaCompensationStuck` (page)
 - `SagaCompensationSlow` (ticket, oldest over 10m)
 - `SagaCompensationMetricsMissing` (ticket)
+- `SagaDeadLettersPending` (ticket, per topic, `max by (topic)` over instances)
+- `SagaDeadLetterMetricsMissing` (ticket, per topic)
 
 Prometheus and Alertmanager are **not** part of docker-compose.
 
@@ -235,6 +249,8 @@ Prometheus and Alertmanager are **not** part of docker-compose.
 - Jackson 3: inject `tools.jackson.databind.json.JsonMapper`. Exceptions are unchecked, and `JsonNode.asText()` is now `asString()`.
 - Kafka JSON serde classes are now `JacksonJsonSerializer`/`JacksonJsonDeserializer` (unused here; String serde + own codec).
 - `@EntityScan` lives in `org.springframework.boot.persistence.autoconfigure` (avoided via package layout).
+- **Test slices are separate modules.** `@DataJpaTest` comes from `spring-boot-starter-data-jpa-test` (package `org.springframework.boot.data.jpa.test.autoconfigure`); `@AutoConfigureTestDatabase` is in `org.springframework.boot.jdbc.test.autoconfigure`. Flyway still runs in the slice: `spring-boot-flyway` registers itself under `AutoConfigureDataSourceInitialization`. `@DataJpaTest` turns SQL logging on by default (`showSql = false` turns it off).
+- `spring-boot-actuator` (the non-starter module that saga-common uses) does **not** bring `micrometer-core`; declare it.
 - Spring Kafka's default DLT suffix is `-dlt` (not `.DLT`). A `CommonErrorHandler` bean is auto-wired into Boot's listener factory.
 - Custom actuator endpoints: optional params use jspecify `@Nullable`; write-op params bind from the JSON body; `WebEndpointResponse` sets the status.
 - **Don't put `@Validated` on `@RestController`s.** Spring MVC (6.1+) validates constraint-annotated params itself and answers 400 (`HandlerMethodValidationException`). Class-level `@Validated` routes them through the AOP `MethodValidationInterceptor` instead, whose `ConstraintViolationException` surfaces as a 500.
@@ -278,7 +294,15 @@ curl http://localhost:8081/orders/<id>
 - **Faster timeout demo:** start order-service with `--saga.timeout.payment=10s --saga.timeout.inventory=10s --saga.timeout.shipping=10s --saga.timeout.compensation=10s`.
 
 ## Tests
-- `mvn clean verify` builds everything and runs `SagaEndToEndIT`: 33 tests, about 3 minutes. Docker is required; the suite is skipped automatically without it. Add `-DskipITs` to skip it.
+- `mvn test`: per-service tests, about a minute (see [Codebase tour §5.1](docs/CODEBASE.md#51-per-service-tests)):
+  - `OrderSagaTest` (108) and `OrderSagaOrchestratorTest` (89): plain JUnit and Mockito, no Spring;
+  - `PaymentCommandHandlerTest` (6), `InventoryCommandHandlerTest` (7), `ShippingCommandHandlerTest` (6) and `NotificationHandlerTest` (4): `@PostgresSliceTest` (`@DataJpaTest` + Testcontainers Postgres 17 + the service's Flyway migrations), from the saga-common **test-jar**.
+- `mvn clean verify` also runs `SagaEndToEndIT`: 34 tests, about 3 minutes. Docker is required; both suites are skipped automatically without it. Add `-DskipITs` to skip the e2e suite only.
+- Slice-test conventions:
+  - each test uses fresh UUID ids and runs in a rolled-back transaction;
+  - tests that need the handler's own commit or rollback are `@Transactional(propagation = NOT_SUPPORTED)`;
+  - replies are read back from the outbox table, decoded by the real codec.
+  - `-Dmaven.test.skip=true` breaks the build: it skips the test-jar the services depend on. Use `-DskipTests`.
 - Alert rules are tested separately:
   ```
   docker run --rm -v "%cd%\ops\prometheus":/rules --entrypoint promtool prom/prometheus test rules /rules/saga-alerts.test.yml
@@ -296,6 +320,7 @@ curl http://localhost:8081/orders/<id>
 |---|---|
 | Happy / business paths | approve (shipment SCHEDULED with tracking number, OrderApproved notified); default destination GB; insufficient credit; unknown customer; out of stock → refund; 10 concurrent orders on 50 stock → exactly 5 approved and 5 refunded; 400 on invalid input |
 | DLT | non-retryable → DLT in under 7s with headers kept; unknown-saga reply → DLT and the flow keeps working; retryable NPE → DLT only after the full backoff (at least 7s), with no side effects |
+| DLT metrics | every service exports `saga_dlt_pending` for exactly the DLT it owns; a dead-lettered reply raises order-service's gauge |
 | Replay | a reply that arrived before its saga, replayed after the cause is fixed → APPROVED; a still-broken record returns with `dltReplayCount=1`; endpoint scoping and 400s |
 | Timeouts | a stalled participant (poison on every partition) → "Payment timed out" / "Inventory timed out"; the late charge is refunded and the late reservation released |
 | Shipping | unshippable destination → release then refund, in that order; closing and reopening a zone; shipping timeout (poison stall) → late shipment cancelled, stock released, payment refunded |
@@ -327,6 +352,14 @@ curl http://localhost:8081/orders/<id>
 - [x] 2026-10-10: **shipping-service** (pivot, reverse-order compensation, CANCELLING_SHIPMENT, zones, fencing) and **notification-service** (order events on `order.events`, choreography, retriable step with provider outage, exactly-once notification). Console: 4×2 map, five lanes, destination, zones, provider switch, Unshippable destination scenario. 33 e2e tests green; headless-Chrome check of every new view; manual outage check (shipping-service stopped mid-saga → CANCELLING_SHIPMENT → restart → late shipment cancelled, stock and credit restored, customer notified).
 - [x] 2026-10-12: Architecture guide explains orchestration vs choreography: what each is, a comparison, where each is used here (saga commands and replies vs `order.events`), why, the outbox hand-over between them, how to see it in the console, and which style a new service should use.
 - [x] 2026-10-12: recorded the RESTEasy/JAX-RS port analysis (see "Evaluated: porting off Spring Boot").
+- [x] 2026-10-16: **Per-service tests**: 220 tests (state machine and orchestrator without Spring; participant handlers as Postgres slices). Shared `@PostgresSliceTest` and `TestMessages` in the saga-common test-jar.
+- [x] 2026-10-16: **Dead-letter alerting**:
+  - `DltMetrics` (`saga_dlt_pending{topic,dlt}`, own refresh thread, updated on replay);
+  - Prometheus export on all five services;
+  - `SagaDeadLettersPending` and `SagaDeadLetterMetricsMissing` with promtool tests;
+  - a single `saga-services` scrape job;
+  - runbook entries.
+  34 e2e tests green.
 
 ## Evaluated: porting off Spring Boot (RESTEasy / JAX-RS), 2026-10-12
 
@@ -359,7 +392,7 @@ curl http://localhost:8081/orders/<id>
 2. **A Jakarta EE / MicroProfile server** such as WildFly, which ships RESTEasy. Weaker Kafka support.
 3. **Plain embedded RESTEasy** (Undertow/Netty), with every library assembled by hand. Rewrites the transactions, retry/DLT and security; the most work and the most risk.
 
-**If ever tried:** pilot one participant service (inventory or shipping) on Quarkus, and run it against the unchanged 33-test e2e suite. It tests over HTTP and Kafka, not Spring internals, so it checks the port as it stands.
+**If ever tried:** pilot one participant service (inventory or shipping) on Quarkus, and run it against the unchanged e2e suite. It tests over HTTP and Kafka, not Spring internals, so it checks the port as it stands.
 
 ## Next / open
 - [ ] **Production identity setup:**
@@ -371,8 +404,6 @@ curl http://localhost:8081/orders/<id>
 - [ ] AKHQ is still unauthenticated (dev only); it supports OIDC if it ever leaves local development.
 - [ ] Decide whether `saga-ui` should exist outside local/dev at all (it binds 127.0.0.1 by default).
 - [ ] Browser tests for the console in CI (e.g. Playwright for Java), if it becomes more than a dev tool.
-- [ ] Per-service slice tests (orchestrator transitions on illegal or out-of-order replies, duplicate-delivery idempotency). Today everything is proven through e2e only.
-- [ ] Alert on DLT pending > 0 (expose `DltReplayer.status` as a gauge, add a rule and a runbook entry).
 - [ ] Participant-side admin operations (refund or release through payment and inventory endpoints) so `resolve` never needs raw SQL.
 - [ ] Selective DLT replay (by messageId or offset range) and a "skip" operation for known-garbage records.
 - [ ] Outbox cleanup job (published rows grow forever) and `processed_message` retention.

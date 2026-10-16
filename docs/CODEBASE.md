@@ -29,9 +29,9 @@ flowchart LR
 
 | Module | Packaging | Depends on | Key dependencies |
 |---|---|---|---|
-| `saga-common` | plain jar | – | data-jpa, kafka, json, spring-boot-actuator, oauth2-resource-server |
+| `saga-common` | plain jar (+ test-jar with slice-test support) | – | data-jpa, kafka, json, spring-boot-actuator, micrometer-core, oauth2-resource-server |
 | `order-service` | Boot jar | saga-common | webmvc, validation, actuator, flyway, postgresql, micrometer-registry-prometheus |
-| `payment-service` | Boot jar | saga-common | webmvc, validation, actuator, flyway, postgresql |
+| `payment-service` | Boot jar | saga-common | webmvc, validation, actuator, flyway, postgresql, micrometer-registry-prometheus |
 | `inventory-service` | Boot jar | saga-common | same as payment |
 | `shipping-service` | Boot jar | saga-common | same as payment |
 | `notification-service` | Boot jar | saga-common | same as payment |
@@ -57,7 +57,7 @@ com.saga
 │   ├── idempotency             ProcessedMessage, IdempotencyGuard
 │   ├── security                SagaSecurityConfig (the access rulebook for all five services)
 │   ├── kafka                   KafkaErrorHandlingConfig (retry/DLT), RetryProperties
-│   │   └── dlt                 DltEndpoint, DltReplayer
+│   │   └── dlt                 DltEndpoint, DltReplayer, DltMetrics, OwnedTopics
 │   └── SagaCommonConfig        @EnableScheduling + topic creation
 ├── order                       (order-service)
 │   ├── api                     OrderController, OrderService, request/response records
@@ -158,6 +158,7 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 | `kafka/KafkaErrorHandlingConfig` | `DefaultErrorHandler` + exponential backoff + DLT + not-retryable exceptions + retry logging |
 | `kafka/RetryProperties` | `saga.kafka.retry.*` |
 | `kafka/dlt/DltEndpoint`, `DltReplayer` | Actuator `dlt`: pending counts and replay, scoped to this service's listeners |
+| `kafka/dlt/DltMetrics`, `OwnedTopics` | `saga_dlt_pending{topic,dlt}` gauge per owned DLT, refreshed on its own thread; the topics this service's listeners consume |
 | `SagaCommonConfig` | `@EnableScheduling`; declares the 5 topics + 5 DLTs (3 partitions, DLT retention 14 days) |
 | `security/SagaSecurityConfig` | OAuth2 resource-server `SecurityFilterChain`: who may call which method + path (public / viewer / operator / admin / metrics), stateless, deny by default |
 
@@ -222,11 +223,29 @@ Follow `POST /orders` for a successful order. Each step names the class and meth
 
 ## 5. The tests
 
-Everything is tested end-to-end in **`saga-e2e`**. There are no per-service unit or slice tests yet (an open item in PROJECT.md).
+There are two layers of tests:
+- **Per-service tests** run in the `test` phase (`mvn test`, about a minute in total).
+  - The order saga is tested without Spring: its state machine, and the orchestrator against mocks.
+  - Every participant handler is tested as a JPA slice against a real Postgres, with the service's own Flyway migrations.
+- **End-to-end tests** in **`saga-e2e`** run in the `integration-test` phase.
+
+### 5.1 Per-service tests
+
+| File | What it proves |
+|---|---|
+| [`OrderSagaTest`](../order-service/src/test/java/com/saga/order/saga/OrderSagaTest.java) | Each of the 12 transitions is legal from exactly one state; from any other state it throws and changes nothing. Deadlines are set or cleared; `compensatingSince` is kept; re-sends reset per compensation step; resend, retry and resolve only work while compensating |
+| [`OrderSagaOrchestratorTest`](../order-service/src/test/java/com/saga/order/saga/OrderSagaOrchestratorTest.java) | Each reply in its state sends exactly the next command or event. Each reply in any of the 7 other states (late, early, stale) is ignored with no message sent. Duplicates are dropped before the saga is loaded; a re-sent reply with a new id is stopped by the state guard. Unknown sagas and non-replies are non-retryable. Timeouts per state; compensation re-sends are reported only after commit |
+| [`PaymentCommandHandlerTest`](../payment-service/src/test/java/com/saga/payment/PaymentCommandHandlerTest.java), [`InventoryCommandHandlerTest`](../inventory-service/src/test/java/com/saga/inventory/InventoryCommandHandlerTest.java), [`ShippingCommandHandlerTest`](../shipping-service/src/test/java/com/saga/shipping/ShippingCommandHandlerTest.java) | Same messageId twice → handled once. Same command under a new messageId (a re-sent step or compensation) → applied once, answered every time. A compensation that overtakes its step leaves a tombstone that refuses the late step. Foreign commands are non-retryable. Payment: a failed attempt rolls back the processed marker, so the redelivery is handled, not skipped |
+| [`NotificationHandlerTest`](../notification-service/src/test/java/com/saga/notification/NotificationHandlerTest.java) | One notification per order outcome however often the event arrives; a provider outage leaves no marker, so the retry notifies once |
+| [`PostgresSliceTest`](../saga-common/src/test/java/com/saga/common/test/PostgresSliceTest.java), [`TestMessages`](../saga-common/src/test/java/com/saga/common/test/TestMessages.java) (saga-common test-jar) | `@DataJpaTest` against a Testcontainers Postgres 17 (one per module, through the context cache), with the codec, idempotency guard and outbox writer; builds records the way the relay publishes them and decodes what a handler wrote to the outbox. Skipped without Docker |
+
+### 5.2 End-to-end tests
+
+Everything is also tested end-to-end in **`saga-e2e`**.
 
 | File | Role |
 |---|---|
-| [`SagaEndToEndIT`](../saga-e2e/src/test/java/com/saga/e2e/SagaEndToEndIT.java) | 33 tests (mapped to scenarios in [SCENARIOS.md › Scenario 14](SCENARIOS.md#scenario-14--the-automated-suite)) |
+| [`SagaEndToEndIT`](../saga-e2e/src/test/java/com/saga/e2e/SagaEndToEndIT.java) | 34 tests (mapped to scenarios in [SCENARIOS.md › Scenario 14](SCENARIOS.md#scenario-14--the-automated-suite)) |
 | [`ServiceProcess`](../saga-e2e/src/test/java/com/saga/e2e/ServiceProcess.java) | Starts a jar as a child JVM on a free port with `--property=value` overrides, waits for `/actuator/health`, logs to `target/e2e-logs/<name>.log` |
 | [`KafkaProbe`](../saga-e2e/src/test/java/com/saga/e2e/KafkaProbe.java) | Sends raw records (any headers, any partition) and waits for a given `messageId` on a DLT |
 | [`KeycloakSupport`](../saga-e2e/src/test/java/com/saga/e2e/KeycloakSupport.java) | Keycloak Testcontainer with the same realm file as docker-compose; tokens per dev user (cached a minute), client-credentials and wrong-realm tokens; points the console client's redirect URI at the console's random port |
@@ -241,7 +260,7 @@ How the suite works:
   - Postgres triggers that make refunds fail or block their reply (for stuck and intervention tests).
 - **Ordering:** those tests run last via `@Order(AFTER_EVERYTHING_ELSE)`, so the replay tests don't replay their poison records.
 
-Run it with `mvn clean verify`. The promtool tests for the alert rules are separate ([Getting started §8](GETTING-STARTED.md#8-run-the-tests)).
+Run everything with `mvn clean verify`, or only the per-service tests with `mvn test`. The promtool tests for the alert rules are separate ([Getting started §8](GETTING-STARTED.md#8-run-the-tests)).
 
 ---
 

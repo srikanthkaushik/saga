@@ -215,12 +215,17 @@ Wipe Postgres and Kafka **together**. If you clear only one, the other still ref
 ```
 mvn clean verify
 ```
-This builds everything, then `saga-e2e` runs `SagaEndToEndIT`: **33 tests in about 3 minutes**. It uses Testcontainers to start its *own* Postgres, Kafka and Keycloak on random ports, so it doesn't touch your `docker compose` data. It then launches the six real jars as child processes.
+This builds everything and runs the **per-service tests** (the orchestrator and saga state machine without Spring; each participant handler against its own Postgres container, about a minute in all). Then `saga-e2e` runs `SagaEndToEndIT`: **34 tests in about 3 minutes**. It uses Testcontainers to start its *own* Postgres, Kafka and Keycloak on random ports, so it doesn't touch your `docker compose` data. It then launches the six real jars as child processes.
 - **Docker must be running.** Without Docker the suite is skipped, not failed.
 - **Stop your locally running services first.** `clean` can't delete a jar that a running service has open on Windows.
 - **Where to look:**
   - Service logs from the test run: `saga-e2e\target\e2e-logs\` (one file per service)
   - Test reports: `saga-e2e\target\failsafe-reports\`
+
+Only the per-service tests (no Kafka, no Keycloak; Postgres via Testcontainers):
+```
+mvn test
+```
 
 Run a single test:
 ```
